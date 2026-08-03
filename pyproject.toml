@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oarena"
+version = "2.0.0"
+description = "Local bot league for the Florent Code League (fcode), with TrueSkill ratings and a live web dashboard."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "trueskill>=0.4.5",
+    "click>=8.1",
+    "rich>=13",
+]
+
+# `fcode` is a hard runtime requirement but is deliberately NOT declared here:
+# it ships a compiled engine (fcode_engine.*.so) built for one exact CPython
+# version, so it is resolved from the ambient interpreter instead. See install.sh.
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+oarena = "oarena.cli:main"
+oarena-platform-sidecar = "oarena.platform_sidecar:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+oarena = [
+    "web/*",
+    "square_visualiser/*",
+    "square_visualiser/assets/*",
+    "square_visualiser/fonts/*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not slow'"
+markers = ["slow: runs a real fcode game"]

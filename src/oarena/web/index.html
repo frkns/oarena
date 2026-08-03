@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="robots" content="noindex">
+<title>oarena</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.ico">
+
+<!-- The server stamps data-theme from this project's oarena.toml before paint. -->
+
+<link rel="stylesheet" href="/static/app.css">
+<script type="module" src="/static/app.js"></script>
+</head>
+
+<body>
+<a class="skip-link" href="#view">Skip to the current view</a>
+
+<!-- ── topbar ──────────────────────────────────────────────────────────── -->
+<header class="topbar" id="topbar">
+  <a class="brand" id="brand" href="#/ladder" title="oarena — local bot league">
+    <span class="brand-mark" aria-hidden="true">◆</span>
+    <span class="brand-name">oarena</span>
+  </a>
+
+  <div class="project" id="project">
+    <span class="project-name" id="project-name">…</span>
+    <span class="project-meta" id="project-meta"></span>
+  </div>
+
+  <div class="topbar-spacer"></div>
+
+  <div class="status-pill" id="status-pill" data-state="idle" title="Arena status">
+    <span class="status-dot" aria-hidden="true"></span>
+    <span class="status-body">
+      <span class="status-text" id="status-text">idle</span>
+      <span class="status-sub" id="status-sub"></span>
+    </span>
+    <span class="progress" id="status-progress" role="progressbar"
+          aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
+          aria-labelledby="status-text" hidden>
+      <span class="progress-fill" id="status-progress-fill"></span>
+    </span>
+    <span class="status-count num" id="status-count"></span>
+  </div>
+
+  <div class="topbar-actions">
+    <button class="btn btn-primary" id="btn-run" type="button" title="Run games  (r)">
+      <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3.4v9.2L13 8z" fill="currentColor"/></svg>
+      <span>Run</span>
+    </button>
+    <button class="btn btn-danger" id="btn-stop" type="button" title="Stop the current run  (s)" disabled>
+      <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1" fill="currentColor"/></svg>
+      <span>Stop</span>
+    </button>
+
+    <span class="topbar-sep" aria-hidden="true"></span>
+
+    <button class="btn btn-ghost btn-icon" id="btn-sync" type="button" title="Rescan bots and maps" aria-label="Rescan bots and maps">
+      <svg class="icon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M13.5 7A5.5 5.5 0 0 0 3.6 4.2M2.5 9a5.5 5.5 0 0 0 9.9 2.8"/>
+        <path d="M13.5 2.6V5H11M2.5 13.4V11H5"/>
+      </svg>
+    </button>
+    <button class="btn btn-ghost btn-icon theme-toggle" id="btn-theme" type="button" aria-label="Switch theme" title="Switch theme">
+      <svg class="icon icon-moon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">
+        <path d="M13 9.8A5.6 5.6 0 0 1 6.2 3a5.6 5.6 0 1 0 6.8 6.8z"/>
+      </svg>
+      <svg class="icon icon-sun" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+        <circle cx="8" cy="8" r="3.1"/>
+        <path d="M8 1.4v1.6M8 13v1.6M1.4 8h1.6M13 8h1.6M3.3 3.3l1.2 1.2M11.5 11.5l1.2 1.2M12.7 3.3l-1.2 1.2M4.5 11.5l-1.2 1.2"/>
+      </svg>
+    </button>
+    <button class="btn btn-ghost btn-icon" id="btn-shortcuts" type="button" aria-label="Keyboard shortcuts" title="Keyboard shortcuts  (?)">
+      <span class="kbd-glyph" aria-hidden="true">?</span>
+    </button>
+  </div>
+</header>
+
+<!-- ── rail + view ─────────────────────────────────────────────────────── -->
+<div class="shell" id="shell">
+  <nav class="rail" id="rail" aria-label="Views">
+    <ul class="rail-list">
+      <li>
+        <a class="rail-item" id="nav-ladder" href="#/ladder" data-view="ladder">
+          <svg class="rail-icon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">
+            <rect x="2" y="9" width="3.2" height="4.6" rx="1"/>
+            <rect x="6.4" y="5.4" width="3.2" height="8.2" rx="1"/>
+            <rect x="10.8" y="2.4" width="3.2" height="11.2" rx="1"/>
+          </svg>
+          <span class="rail-label">Ladder</span>
+          <span class="rail-key" aria-hidden="true">1</span>
+        </a>
+      </li>
+      <li>
+        <a class="rail-item" id="nav-matrix" href="#/matrix" data-view="matrix">
+          <svg class="rail-icon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">
+            <rect x="2.4" y="2.4" width="11.2" height="11.2" rx="1.6"/>
+            <path d="M2.4 6.1h11.2M2.4 9.9h11.2M6.1 2.4v11.2M9.9 2.4v11.2"/>
+          </svg>
+          <span class="rail-label">Matrix</span>
+          <span class="rail-key" aria-hidden="true">2</span>
+        </a>
+      </li>
+      <li>
+        <a class="rail-item" id="nav-games" href="#/games" data-view="games">
+          <svg class="rail-icon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">
+            <rect x="2.4" y="2.4" width="11.2" height="11.2" rx="2"/>
+            <path d="M6.6 5.7 10.7 8l-4.1 2.3z"/>
+          </svg>
+          <span class="rail-label">Games</span>
+          <span class="rail-key" aria-hidden="true">3</span>
+        </a>
+      </li>
+      <li>
+        <a class="rail-item" id="nav-bots" href="#/bots" data-view="bots">
+          <svg class="rail-icon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2.8" y="5.4" width="10.4" height="7.8" rx="2.2"/>
+            <path d="M8 2.2v3.2M5.9 9h.01M10.1 9h.01M1.4 8.6v1.8M14.6 8.6v1.8"/>
+          </svg>
+          <span class="rail-label">Bots</span>
+          <span class="rail-key" aria-hidden="true">4</span>
+        </a>
+      </li>
+      <li>
+        <a class="rail-item" id="nav-maps" href="#/maps" data-view="maps">
+          <svg class="rail-icon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">
+            <path d="m2.2 4.4 3.9-2 3.8 2 3.9-2v9.2l-3.9 2-3.8-2-3.9 2z"/>
+            <path d="M6.1 2.4v9.2M9.9 4.4v9.2"/>
+          </svg>
+          <span class="rail-label">Maps</span>
+          <span class="rail-key" aria-hidden="true">5</span>
+        </a>
+      </li>
+      <li>
+        <a class="rail-item" id="nav-storage" href="#/storage" data-view="storage">
+          <svg class="rail-icon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">
+            <ellipse cx="8" cy="3.5" rx="4.8" ry="1.8"/>
+            <path d="M3.2 3.5v8.8c0 1 2.1 1.8 4.8 1.8s4.8-.8 4.8-1.8V3.5M3.2 7.8c0 1 2.1 1.8 4.8 1.8s4.8-.8 4.8-1.8"/>
+          </svg>
+          <span class="rail-label">Storage</span>
+          <span class="rail-key" aria-hidden="true">6</span>
+        </a>
+      </li>
+      <li>
+        <a class="rail-item" id="nav-fcode" href="#/fcode" data-view="fcode">
+          <svg class="rail-icon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 5.2h10M3 10.8h10M5.2 3v10M10.8 3v10"/>
+            <path d="M2.4 2.4h11.2v11.2H2.4z"/>
+          </svg>
+          <span class="rail-label">FCode</span>
+          <span class="rail-key" aria-hidden="true">7</span>
+        </a>
+      </li>
+      <li>
+        <a class="rail-item" id="nav-test-runs" href="#/test-runs" data-view="test-runs">
+          <svg class="rail-icon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 2.3h4M7 2.3v3.4l-3.6 6.1a1.2 1.2 0 0 0 1 1.9h7.2a1.2 1.2 0 0 0 1-1.9L9 5.7V2.3"/>
+            <path d="M5.2 9.1h5.6"/>
+          </svg>
+          <span class="rail-label">Test runs</span>
+          <span class="rail-key" aria-hidden="true">8</span>
+        </a>
+      </li>
+    </ul>
+
+    <div class="rail-foot" id="rail-foot">
+      <div class="rail-stat"><span class="rail-stat-n num" id="count-bots">–</span><span class="rail-stat-l">bots</span></div>
+      <div class="rail-stat"><span class="rail-stat-n num" id="count-games">–</span><span class="rail-stat-l">games</span></div>
+      <div class="rail-stat"><span class="rail-stat-n num" id="count-maps">–</span><span class="rail-stat-l">maps</span></div>
+      <div class="rail-version" id="rail-version"></div>
+    </div>
+  </nav>
+
+  <main class="main" id="view" tabindex="-1" data-view="">
+    <div class="view">
+      <div class="empty">
+        <div class="empty-title">Loading the arena…</div>
+        <div class="empty-hint">Reading <code>/api/state</code>.</div>
+      </div>
+    </div>
+  </main>
+
+  <aside class="drawer-host" id="drawer-host" hidden></aside>
+</div>
+
+<!-- Persistent Square viewer. It stays connected and renderable offscreen so
+     route changes never recreate Phaser or reload its textures. app.js moves
+     this fixed host over the active game slot and handles replay switching. -->
+<div class="square-viewer-host" id="square-viewer-host" data-active="false" aria-hidden="true">
+  <iframe class="square-viewer-iframe" id="square-viewer-frame"
+          src="/square-viz/?metadataUrl=%2Fapi%2Ffcode-metadata"
+          title="Square 2D replay viewer" allow="fullscreen" loading="eager"
+          tabindex="-1" aria-hidden="true"></iframe>
+  <div class="square-viewer-status" id="square-viewer-status" role="status" aria-live="polite">
+    <span class="square-viewer-spinner" aria-hidden="true"></span>
+    <span id="square-viewer-status-text">Preparing 2D viewer…</span>
+  </div>
+</div>
+
+<!-- ── activity log strip ──────────────────────────────────────────────── -->
+<section class="logstrip" id="log-strip" data-open="false" aria-label="Activity log">
+  <div class="logstrip-bar">
+    <button class="logstrip-toggle" id="log-toggle" type="button" aria-expanded="false" aria-controls="log-lines">
+      <span class="caret" aria-hidden="true"></span>
+      <span>Activity</span>
+    </button>
+    <span class="logstrip-peek" id="log-peek"></span>
+    <span class="topbar-spacer"></span>
+    <span class="conn-dot" id="conn-dot" data-state="connecting" title="Event stream"></span>
+    <button class="btn btn-ghost btn-xs" id="log-clear" type="button">Clear</button>
+  </div>
+  <div class="logstrip-body" id="log-lines" role="log" aria-live="polite" aria-relevant="additions"></div>
+</section>
+
+<!-- ── overlay hosts ───────────────────────────────────────────────────── -->
+<div class="modal-host" id="modal-host" hidden></div>
+<div class="toast-host" id="toast-host" role="status" aria-live="polite"></div>
+<div class="tooltip" id="tooltip" role="tooltip" hidden></div>
+
+<div class="offline" id="offline-banner" role="alert" hidden>
+  <span class="offline-dot" aria-hidden="true"></span>
+  <span class="offline-text" id="offline-text">Disconnected from the arena — retrying…</span>
+  <button class="btn btn-ghost btn-xs" id="offline-retry" type="button">Retry now</button>
+</div>
+
+<p class="sr-only" id="sr-status" role="status" aria-live="polite"></p>
+
+<noscript>
+  <div class="noscript">oarena's dashboard needs JavaScript. The JSON API at <code>/api/state</code> works without it.</div>
+</noscript>
+
+<!-- ── inert templates (clone-and-fill; nothing here renders on its own) ── -->
+<template id="tpl-run-dialog">
+  <div class="modal modal-lg" id="run-dialog" role="dialog" aria-modal="true" aria-labelledby="run-title">
+    <header class="modal-head">
+      <h2 class="modal-title" id="run-title">Run games</h2>
+      <button class="btn btn-ghost btn-icon modal-close" id="run-close" type="button" aria-label="Close">✕</button>
+    </header>
+
+    <div class="tabs" id="run-tabs" role="tablist" aria-label="Run mode">
+      <button class="tab" id="run-tab-match" type="button" role="tab" aria-selected="true" aria-controls="run-panel-match">Match</button>
+      <button class="tab" id="run-tab-arena" type="button" role="tab" aria-selected="false" aria-controls="run-panel-arena">Arena</button>
+    </div>
+
+    <div class="modal-body">
+      <section class="tabpanel" id="run-panel-match" role="tabpanel" aria-labelledby="run-tab-match">
+        <div class="field-row">
+          <div class="field">
+            <label class="field-label" for="run-bot-a">Bot A</label>
+            <div class="bot-combobox">
+              <input class="input" id="run-bot-a" type="text" role="combobox"
+                aria-autocomplete="list" aria-expanded="false" aria-haspopup="listbox"
+                aria-controls="run-bot-a-options" placeholder="Type or choose a bot"
+                autocomplete="off" autocapitalize="none" spellcheck="false">
+              <div class="bot-combobox-list" id="run-bot-a-options" role="listbox" hidden></div>
+            </div>
+          </div>
+          <button class="btn btn-ghost btn-icon" id="run-swap" type="button" aria-label="Swap sides" title="Swap sides">⇄</button>
+          <div class="field">
+            <label class="field-label" for="run-bot-b">Bot B</label>
+            <div class="bot-combobox">
+              <input class="input" id="run-bot-b" type="text" role="combobox"
+                aria-autocomplete="list" aria-expanded="false" aria-haspopup="listbox"
+                aria-controls="run-bot-b-options" placeholder="Type or choose a bot"
+                autocomplete="off" autocapitalize="none" spellcheck="false">
+              <div class="bot-combobox-list" id="run-bot-b-options" role="listbox" hidden></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="field">
+          <div class="field-head">
+            <span class="field-label">Maps</span>
+            <span class="field-actions">
+              <button class="btn btn-ghost btn-xs" id="run-maps-all" type="button">All</button>
+              <button class="btn btn-ghost btn-xs" id="run-maps-none" type="button">None</button>
+              <button class="btn btn-ghost btn-xs" id="run-maps-invert" type="button">Invert</button>
+            </span>
+          </div>
+          <div class="map-picker-group">
+            <div class="map-picker-head">
+              <span class="map-picker-label">Official maps</span>
+            </div>
+            <div class="chip-set" id="run-maps-official"></div>
+          </div>
+          <div class="map-picker-group">
+            <div class="map-picker-head">
+              <span class="map-picker-label">Extra maps</span>
+              <span class="field-actions">
+                <button class="btn btn-ghost btn-xs" id="run-extra-maps-all" type="button">All</button>
+                <button class="btn btn-ghost btn-xs" id="run-extra-maps-none" type="button">None</button>
+              </span>
+            </div>
+            <div class="chip-set" id="run-maps-extra"></div>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <label class="field field-narrow">
+            <span class="field-label">Rounds per map</span>
+            <input class="input num" id="run-repeat" type="number" min="1" max="500" step="1" value="1">
+          </label>
+          <label class="toggle">
+            <input type="checkbox" id="run-mirror" checked>
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            <span class="toggle-label">Mirror sides</span>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" id="run-rated" checked>
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            <span class="toggle-label">Rated</span>
+          </label>
+        </div>
+
+        <p class="run-count" id="run-count"></p>
+      </section>
+
+      <section class="tabpanel" id="run-panel-arena" role="tabpanel" aria-labelledby="run-tab-arena" hidden>
+        <div class="field-row">
+          <label class="field">
+            <span class="field-label">Matchmaker</span>
+            <select class="select" id="arena-kind">
+              <option value="ladder">Soft ladder (default)</option>
+              <option value="top">Top K</option>
+              <option value="vs">Versus one bot</option>
+              <option value="rr">Round robin</option>
+            </select>
+          </label>
+          <label class="field field-narrow" id="arena-top-field" hidden>
+            <span class="field-label">K</span>
+            <input class="input num" id="arena-top" type="number" min="2" max="64" step="1" value="8">
+          </label>
+          <div class="field" id="arena-target-field" hidden>
+            <label class="field-label" for="arena-target">Target</label>
+            <div class="bot-combobox">
+              <input class="input" id="arena-target" type="text" role="combobox"
+                aria-autocomplete="list" aria-expanded="false" aria-haspopup="listbox"
+                aria-controls="arena-target-options" placeholder="Type or choose a bot"
+                autocomplete="off" autocapitalize="none" spellcheck="false">
+              <div class="bot-combobox-list" id="arena-target-options" role="listbox" hidden></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <label class="field field-narrow">
+            <span class="field-label">Workers</span>
+            <input class="input num" id="arena-workers" type="text" readonly>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" id="arena-rated" checked>
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            <span class="toggle-label">Rated</span>
+          </label>
+        </div>
+
+        <p class="field-hint">An arena runs until you press <b>Stop</b>. Workers are fixed for this
+          server — restart with <code>oarena serve -w N</code> to change them.</p>
+      </section>
+
+      <p class="form-error" id="run-error" hidden></p>
+    </div>
+
+    <footer class="modal-foot">
+      <button class="btn btn-ghost" id="run-cancel" type="button">Cancel</button>
+      <button class="btn btn-primary" id="run-submit" type="button">Start</button>
+    </footer>
+  </div>
+</template>
+
+<template id="tpl-shortcuts">
+  <div class="modal" id="shortcut-sheet" role="dialog" aria-modal="true" aria-labelledby="shortcut-title">
+    <header class="modal-head">
+      <h2 class="modal-title" id="shortcut-title">Keyboard shortcuts</h2>
+      <button class="btn btn-ghost btn-icon modal-close" id="shortcut-close" type="button" aria-label="Close">✕</button>
+    </header>
+    <div class="modal-body">
+      <dl class="shortcuts">
+        <dt><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><kbd>4</kbd><kbd>5</kbd><kbd>6</kbd><kbd>7</kbd><kbd>8</kbd></dt>
+        <dd>Ladder · Matrix · Games · Bots · Maps · Storage · FCode · Test runs</dd>
+        <dt><kbd>r</kbd></dt><dd>Open the Run dialog</dd>
+        <dt><kbd>s</kbd></dt><dd>Stop the current run</dd>
+        <dt><kbd>/</kbd></dt><dd>Focus the filter box</dd>
+        <dt><kbd>l</kbd></dt><dd>Toggle the activity log</dd>
+        <dt><kbd>t</kbd></dt><dd>Toggle the theme</dd>
+        <dt><kbd>?</kbd></dt><dd>This sheet</dd>
+        <dt><kbd>Esc</kbd></dt><dd>Close overlays</dd>
+      </dl>
+    </div>
+  </div>
+</template>
+</body>
+</html>
