@@ -385,6 +385,21 @@ def test_list_batch_games_limits_after_ordering_by_planned_ordinal(
     assert games[0].id > games[-1].id
 
 
+def test_latest_match_tag_ignores_later_arena_and_keeps_empty_match(
+    seeded: Store,
+) -> None:
+    assert seeded.latest_match_tag() is None
+
+    seeded.reserve_batch("first-match", mode="match", requested_games=1)
+    assert seeded.latest_match_tag() == "first-match"
+
+    seeded.reserve_batch("later-arena", mode="arena", requested_games=None)
+    assert seeded.latest_match_tag() == "first-match"
+
+    seeded.reserve_batch("empty-newest-match", mode="match", requested_games=0)
+    assert seeded.latest_match_tag() == "empty-newest-match"
+
+
 def test_writer_lease_blocks_a_second_store_but_not_reads(
     seeded: Store, tmp_path: Path
 ) -> None:
@@ -581,7 +596,14 @@ def test_database_import_accepts_a_pre_provenance_v2_source(
     source_store, _source_state = _source_league(tmp_path, rater)
     try:
         source_store.add_game(game("alpha", "beta", "a", rated=True, seed=99))
-        source_store._conn.execute("DROP INDEX idx_games_batch_ordinal")
+        # A real v2 database predates every index that names a provenance
+        # column, so they go before the columns they depend on.
+        for index in (
+            "idx_games_batch_ordinal",
+            "idx_games_side_a",
+            "idx_games_side_b",
+        ):
+            source_store._conn.execute(f"DROP INDEX {index}")
         for column in (
             "a_src_hash",
             "b_src_hash",
@@ -1261,3 +1283,47 @@ def test_pair_counts_include_undecided_games(tmp_path: Path) -> None:
     # matrix() stays decided-only: a timeout carries no head-to-head signal.
     assert store.matrix(["a", "b"])["a"]["b"].games == 0
     store.close()
+
+
+def test_per_bot_ladder_queries_are_indexed_on_both_sides(tmp_path: Path) -> None:
+    """`(a = ? OR b = ?)` needs both sides indexed or it scans every game.
+
+    Indexing only the A side defeats the OR outright, so each of the three
+    per-bot ladder queries fell back to a full table scan -- 25 seconds for one
+    ladder read over 500 bots.
+    """
+    store = Store(tmp_path / "arena.db")
+    try:
+        plan = "\n".join(
+            str(row[3])
+            for row in store._conn.execute(
+                "EXPLAIN QUERY PLAN SELECT ts FROM games "
+                "WHERE ((a = 'x' AND a_src_hash = 'h') "
+                "OR (b = 'x' AND b_src_hash = 'h')) ORDER BY id DESC LIMIT 1"
+            ).fetchall()
+        )
+        assert "SCAN games" not in plan, plan
+        assert "idx_games_side_b" in plan, plan
+    finally:
+        store.close()
+
+
+def test_an_existing_database_gains_the_per_side_indexes(tmp_path: Path) -> None:
+    """The migration short-circuits on a required-index set, so it must list them."""
+    path = tmp_path / "arena.db"
+    Store(path).close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP INDEX idx_games_side_a")
+        connection.execute("DROP INDEX idx_games_side_b")
+
+    reopened = Store(path)
+    try:
+        present = {
+            str(row[0])
+            for row in reopened._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+        assert {"idx_games_side_a", "idx_games_side_b"} <= present
+    finally:
+        reopened.close()

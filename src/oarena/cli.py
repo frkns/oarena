@@ -733,6 +733,95 @@ def sync_cmd(as_json: bool) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# stochastic flow benchmark
+# --------------------------------------------------------------------------- #
+
+
+@main.command(name="flow-benchmark")
+@click.argument("candidate", required=False, default="v7")
+@click.option("--opponent", default="do_nothing", show_default=True)
+@click.option("--maps-dir", type=click.Path(path_type=Path, file_okay=False))
+@click.option(
+    "--seed",
+    type=click.IntRange(0, 0xFFFF_FFFF_FFFF_FFFF),
+    default=1_587_658_667,
+    show_default=True,
+)
+@click.option("-w", "--workers", type=click.IntRange(1), default=2, show_default=True)
+@click.option("--timeout-s", type=click.FloatRange(min=0.001), default=600.0, show_default=True)
+@click.option("--mutation-percent", default="0.1", metavar="M", show_default=True)
+@click.option("--emission-percent", default="1", metavar="E", show_default=True)
+@click.option("--skylight-percent", default="20", show_default=True)
+@click.option(
+    "--skylight-damage",
+    type=click.IntRange(1, 0x7FFF_FFFF),
+    default=18,
+    show_default=True,
+)
+@click.option("--output", type=click.Path(path_type=Path, file_okay=False))
+def flow_benchmark_cmd(
+    candidate: str,
+    opponent: str,
+    maps_dir: Path | None,
+    seed: int,
+    workers: int,
+    timeout_s: float,
+    mutation_percent: str,
+    emission_percent: str,
+    skylight_percent: str,
+    skylight_damage: int,
+    output: Path | None,
+) -> None:
+    """Run the unrated stochastic routing benchmark on every official map.
+
+    CANDIDATE is a bot name or directory. Games use a fixed 200 ms callback
+    ceiling, both seats, standard replay files, and a resumable dedicated run
+    directory; they never affect the TrueSkill ladder.
+    """
+
+    cfg = configmod.load()
+    if str(cfg.root) not in sys.path:
+        sys.path.insert(0, str(cfg.root))
+    benchmark_file = cfg.root / "problems" / "flow_benchmark" / "benchmark.py"
+    if not benchmark_file.is_file():
+        raise click.ClickException(
+            f"this project has no flow benchmark implementation at {benchmark_file}"
+        )
+    try:
+        from problems.flow_benchmark.benchmark import parse_args, run_benchmark
+
+        def bot_path(value: str) -> Path:
+            direct = Path(value)
+            if direct.is_absolute():
+                return direct
+            if direct.exists():
+                return direct.resolve()
+            if "/" in value:
+                return cfg.root / direct
+            return cfg.bots_dir / value
+
+        arguments = [
+            "--candidate", str(bot_path(candidate)),
+            "--opponent", str(bot_path(opponent)),
+            "--maps-dir", str(maps_dir or cfg.maps_dir),
+            "--seed", str(seed),
+            "--workers", str(workers),
+            "--timeout-s", str(timeout_s),
+            "--mutation-percent", mutation_percent,
+            "--emission-percent", emission_percent,
+            "--skylight-percent", skylight_percent,
+            "--skylight-damage", str(skylight_damage),
+        ]
+        if output is not None:
+            arguments.extend(("--output", str(output)))
+        run_benchmark(parse_args(arguments))
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 - present the benchmark's fail-closed reason
+        raise click.ClickException(str(exc)) from exc
+
+
+# --------------------------------------------------------------------------- #
 # match
 # --------------------------------------------------------------------------- #
 

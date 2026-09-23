@@ -35,6 +35,8 @@ const catalog = {
       repeat: 1,
       mirror: true,
       rated: true,
+      seedPolicy: "random",
+      seed: "1",
     },
     arena: { kind: "ladder", top: 8, target: "alpha", rated: true },
   },
@@ -89,6 +91,77 @@ test("planned first game prefers ordinal zero, then the lowest ordinal and id", 
       { id: 40, batch_ordinal: 2 },
     ]).id,
     40,
+  );
+});
+
+test("latest match membership requires the exact safe tag and a planned ordinal", () => {
+  const game = { id: 7, tag: "web-match-newest", batch_ordinal: 0 };
+
+  assert.equal(runForm.isLatestMatchGame(game, "web-match-newest"), true);
+  assert.equal(runForm.isLatestMatchGame(game, "web-match-older"), false);
+  assert.equal(runForm.isLatestMatchGame({ ...game, batch_ordinal: null }, game.tag), false);
+  assert.equal(runForm.isLatestMatchGame({ ...game, batch_ordinal: "0" }, game.tag), false);
+  assert.equal(runForm.isLatestMatchGame(game, " padded "), false);
+  assert.equal(runForm.isLatestMatchGame(null, game.tag), false);
+});
+
+test("optimistic run status resets stale counters from the previous match", () => {
+  assert.deepEqual(
+    runForm.optimisticRunStatus(
+      {
+        running: false,
+        stopping: false,
+        mode: "match",
+        label: "old vs old",
+        queued: 0,
+        in_flight: 0,
+        done: 12,
+        total: 12,
+        rate: 99,
+        idle_reason: "old wait",
+        live: [{ a: "old", b: "old" }],
+      },
+      {
+        mode: "match",
+        label: "alpha vs beta",
+        total: 4,
+        batchTag: "web-match-new",
+      },
+    ),
+    {
+      running: true,
+      stopping: false,
+      mode: "match",
+      label: "alpha vs beta",
+      queued: 4,
+      in_flight: 0,
+      done: 0,
+      total: 4,
+      rate: 0,
+      idle_reason: "",
+      live: [],
+      web_match_tag: "web-match-new",
+    },
+  );
+});
+
+test("run activity never presents zero games as in flight", () => {
+  assert.equal(runForm.runActivityLabel({ running: false, in_flight: 3 }), "");
+  assert.equal(runForm.runActivityLabel({ running: true, in_flight: 2, queued: 8 }), "2 in flight");
+  assert.equal(runForm.runActivityLabel({ running: true, in_flight: 0, queued: 8 }), "8 queued");
+  assert.equal(runForm.runActivityLabel({ running: true, in_flight: 0, queued: 0 }), "starting");
+  assert.equal(
+    runForm.runActivityLabel({ running: true, in_flight: 0, queued: 0, done: 4, total: 4 }),
+    "finishing",
+  );
+  assert.equal(
+    runForm.runActivityLabel({
+      running: true,
+      in_flight: 0,
+      queued: 0,
+      idle_reason: "no legal matchup",
+    }),
+    "",
   );
 });
 
@@ -254,6 +327,8 @@ test("round-trips every editable Match and Arena choice per project", () => {
       repeat: 37,
       mirror: false,
       rated: false,
+      seedPolicy: "fixed",
+      seed: "20260802001",
     },
     arena: { kind: "top", top: 19, target: "beta", rated: false },
   };
@@ -278,6 +353,23 @@ test("an explicit empty map selection stays empty", () => {
   assert.deepEqual(restored.match.maps, []);
 });
 
+test("Match can restore an off bot while Arena falls back to an active bot", () => {
+  const restored = runForm.normalizeRunDialogDraft(
+    {
+      match: { a: "disabled", b: "alpha" },
+      arena: { target: "disabled" },
+    },
+    {
+      ...catalog,
+      botNames: ["alpha", "beta", "disabled"],
+      arenaBotNames: ["alpha", "beta"],
+    },
+  );
+
+  assert.equal(restored.match.a, "disabled");
+  assert.equal(restored.arena.target, "alpha");
+});
+
 test("stale catalogs and malformed fields fall back without leaking names", () => {
   const restored = runForm.normalizeRunDialogDraft(
     {
@@ -289,6 +381,8 @@ test("stale catalogs and malformed fields fall back without leaking names", () =
         repeat: 900,
         mirror: "yes",
         rated: null,
+        seedPolicy: "wrong",
+        seed: "9223372036854775808",
       },
       arena: { kind: "wrong", top: 1, target: "*", rated: "yes" },
     },
@@ -304,9 +398,25 @@ test("stale catalogs and malformed fields fall back without leaking names", () =
       repeat: 500,
       mirror: true,
       rated: true,
+      seedPolicy: "random",
+      seed: "1",
     },
     arena: { kind: "ladder", top: 2, target: "alpha", rated: true },
   });
+});
+
+test("custom seeds stay exact across the signed SQLite range", () => {
+  assert.equal(runForm.normalizeCustomSeed(424242), "424242");
+  assert.equal(runForm.normalizeCustomSeed("00042"), "42");
+  assert.equal(runForm.normalizeCustomSeed(`${"0".repeat(1000)}1`), "1");
+  assert.equal(runForm.normalizeCustomSeed(runForm.MAX_CUSTOM_SEED), runForm.MAX_CUSTOM_SEED);
+  assert.equal(runForm.normalizeCustomSeed("9223372036854775808"), null);
+  assert.equal(runForm.normalizeCustomSeed(Number.MAX_SAFE_INTEGER + 1), null);
+  assert.equal(runForm.normalizeCustomSeed("1".repeat(1000)), null);
+
+  assert.equal(runForm.customSeedFitsRounds(runForm.MAX_CUSTOM_SEED, 1), true);
+  assert.equal(runForm.customSeedFitsRounds(runForm.MAX_CUSTOM_SEED, 2), false);
+  assert.equal(runForm.customSeedFitsRounds("9223372036854775806", 2), true);
 });
 
 test("corrupt, obsolete, and blocked storage are harmless", () => {
@@ -397,6 +507,24 @@ test("disabled bots are omitted from suggestions even when they match exactly", 
   assert.deepEqual(
     runForm.botSuggestions(rows, "disabled_new").map((row) => row.name),
     ["active_new", "active_old"],
+  );
+  assert.deepEqual(
+    runForm.botSuggestions(rows, "disabled_new", { includeInactive: true })
+      .map((row) => row.name),
+    ["disabled_new", "active_new", "active_old"],
+  );
+});
+
+test("missing bot sources stay out of Match suggestions", () => {
+  const rows = [
+    bot("missing_new", 20, { active: false, source_present: false }),
+    bot("disabled_present", 19, { active: false, source_present: true }),
+    bot("active_present", 18, { source_present: true }),
+  ];
+
+  assert.deepEqual(
+    runForm.botSuggestions(rows, "", { includeInactive: true }).map((row) => row.name),
+    ["disabled_present", "active_present"],
   );
 });
 

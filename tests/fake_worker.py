@@ -310,6 +310,8 @@ def main() -> int:
             "fcode_version": FAKE_FCODE_VERSION,
             "fcode_metadata": FAKE_FCODE_METADATA,
         }
+        if job.get("ruleset") is not None:
+            payload["ruleset_result"] = {"echo": job["ruleset"]}
 
     with open(str(job["result"]), "w", encoding="utf-8") as handle:
         json.dump(payload, handle)

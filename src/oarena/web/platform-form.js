@@ -20,6 +20,46 @@ export function isPlatformMatchId(value) {
   return UUID_PATTERN.test(String(value || "").trim());
 }
 
+function normalizedId(value) {
+  return typeof value === "string" && value.trim()
+    ? value.trim().toLowerCase()
+    : "";
+}
+
+/** Resolve a game's stable winner id to the match team name, never its side. */
+export function platformGameWinnerName(game, match) {
+  const winnerId = normalizedId(game?.winner_id);
+  if (!winnerId) return null;
+  for (const team of [match?.team_a, match?.team_b]) {
+    if (normalizedId(team?.id) !== winnerId) continue;
+    const name = typeof team?.name === "string" ? team.name.trim() : "";
+    return name || null;
+  }
+  return null;
+}
+
+/** Return one team's outcome in a platform match, or null while unresolved. */
+export function platformTeamOutcome(match, teamId) {
+  const target = normalizedId(teamId);
+  const teamA = normalizedId(match?.team_a?.id);
+  const teamB = normalizedId(match?.team_b?.id);
+  if (!target || (target !== teamA && target !== teamB)) return null;
+
+  const winner = normalizedId(match?.winner_id);
+  if (winner) {
+    if (winner === target) return "win";
+    return winner === teamA || winner === teamB ? "loss" : null;
+  }
+  if (String(match?.status || "").toLowerCase() !== "complete") return null;
+
+  const scoreA = match?.score_a;
+  const scoreB = match?.score_b;
+  if (!Number.isFinite(scoreA) || !Number.isFinite(scoreB)) return null;
+  if (scoreA === scoreB) return "draw";
+  const winnerByScore = scoreA > scoreB ? teamA : teamB;
+  return winnerByScore === target ? "win" : "loss";
+}
+
 /**
  * Accept a raw UUID or the public FCode visualiser URL. The official URL may
  * supply its own one-based game number; otherwise `fallbackGame` is used.

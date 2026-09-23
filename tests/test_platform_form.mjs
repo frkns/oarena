@@ -75,3 +75,57 @@ test("builds a safe hash and clamps non-game fallbacks", () => {
   assert.equal(form.platformViewHash(ID, 2, "#/unexpected"), `#/fcode?matchId=${ID}&game=2`);
   assert.equal(form.normalizePlatformGame("9", 1), 1);
 });
+
+test("classifies a selected team's completed match outcome", () => {
+  const A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const base = {
+    status: "complete",
+    team_a: { id: A },
+    team_b: { id: B },
+    score_a: 4,
+    score_b: 1,
+  };
+
+  assert.equal(form.platformTeamOutcome({ ...base, winner_id: A.toUpperCase() }, A), "win");
+  assert.equal(form.platformTeamOutcome({ ...base, winner_id: A }, B), "loss");
+  assert.equal(form.platformTeamOutcome({ ...base, winner_id: null }, A), "win");
+  assert.equal(form.platformTeamOutcome({ ...base, winner_id: null }, B), "loss");
+  assert.equal(
+    form.platformTeamOutcome({ ...base, winner_id: null, score_a: 2, score_b: 2 }, A),
+    "draw",
+  );
+});
+
+test("resolves each game winner by stable team id rather than side", () => {
+  const A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const match = {
+    team_a: { id: A, name: "Alpha" },
+    team_b: { id: B, name: "Beta" },
+  };
+
+  assert.equal(form.platformGameWinnerName({ winner_id: B.toUpperCase(), winner_side: "a" }, match), "Beta");
+  assert.equal(form.platformGameWinnerName({ winner_id: A, winner_side: "b" }, match), "Alpha");
+  assert.equal(form.platformGameWinnerName({ winner_id: null, winner_side: "a" }, match), null);
+  assert.equal(form.platformGameWinnerName({ winner_id: "unknown", winner_side: "b" }, match), null);
+});
+
+test("does not invent outcomes for pending, malformed, or unrelated matches", () => {
+  const A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const C = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const base = {
+    team_a: { id: A },
+    team_b: { id: B },
+    score_a: 5,
+    score_b: 0,
+    winner_id: null,
+  };
+
+  assert.equal(form.platformTeamOutcome({ ...base, status: "running" }, A), null);
+  assert.equal(form.platformTeamOutcome({ ...base, status: "error" }, A), null);
+  assert.equal(form.platformTeamOutcome({ ...base, status: "complete", score_a: null }, A), null);
+  assert.equal(form.platformTeamOutcome({ ...base, status: "complete" }, C), null);
+  assert.equal(form.platformTeamOutcome({ ...base, status: "complete", winner_id: C }, A), null);
+});

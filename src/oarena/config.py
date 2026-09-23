@@ -201,7 +201,7 @@ def _as_replay_budget(data: dict[str, Any]) -> int | None:
 
 
 def _as_ui_theme(data: dict[str, Any]) -> str:
-    """The project-wide dashboard theme, independent of the serving port."""
+    """The dashboard fallback used when this browser origin has no preference."""
     theme = _as_str(data, "ui_theme", "dark").strip().lower()
     if theme not in _UI_THEMES:
         raise ConfigError(f"'ui_theme' must be one of {' | '.join(_UI_THEMES)}, got {theme!r}")
@@ -361,7 +361,7 @@ def default_toml(bots_dir: str = "bots", maps_dir: str = "maps") -> str:
 # oarena — local bot league for the Florent Code League (fcode).
 # State lives in ./{STATE_DIR}/ ; delete that directory to start over.
 
-{bots_line}# every sub-directory holding main.py is a bot
+{bots_line}# recursively finds bot directories holding main.py
 {maps_line}# official *.map26 maps
 {extra_maps_line}# generated/local *.map26 maps
 # state_dir = "/absolute/shared/.oarena"  # optional shared league state
@@ -383,7 +383,7 @@ python_dont_write_bytecode = false  # pass PYTHONDONTWRITEBYTECODE=1 to game wor
 
 replay_budget_mb = 512  # oldest replays are pruned past this; "unlimited" disables pruning
 sigma_reinflate  = 0.5  # on source change, sigma is lifted back to at least 0.5 * sigma0
-ui_theme         = "dark" # dashboard theme; saved by the UI and shared by every server port
+ui_theme         = "dark" # dashboard fallback; each browser origin remembers its choice
 
 [trueskill]
 mu        = {TrueSkillConfig.mu!r}
@@ -470,7 +470,7 @@ def set_ui_theme(path: Path, theme: str) -> None:
     if theme not in _UI_THEMES:
         raise ConfigError(f"'ui_theme' must be one of {' | '.join(_UI_THEMES)}, got {theme!r}")
     path = Path(path)
-    line = f'ui_theme = "{theme}"  # dashboard theme; saved by the UI and shared by every server port'
+    line = f'ui_theme = "{theme}"  # dashboard fallback; each browser origin remembers its choice'
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:

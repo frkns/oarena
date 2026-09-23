@@ -25,9 +25,11 @@ the arena.
 from __future__ import annotations
 
 import base64
+import os
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from typing import Any
 
 MAP_SUFFIX = ".map26"
@@ -229,7 +231,26 @@ class GameMap:
         }
 
     def to_json(self) -> dict[str, Any]:
-        """Serialise for the web UI's thumbnail renderer (tiles are base64)."""
+        """Serialise for the web UI's thumbnail renderer (tiles are base64).
+
+        Cached against the file's identity. Both halves of this -- base64 of the
+        tiles and `analysis()`, which floods the whole board -- depend only on
+        the file, and the dashboard asks for all of them on every `/api/state`:
+        239 maps cost 0.2s per request to recompute unchanged answers.
+        """
+        key = _file_identity(self.path)
+        if key is not None:
+            cached = _JSON_CACHE.get(key)
+            if cached is not None:
+                return cached
+        payload = self._build_json()
+        if key is not None:
+            if len(_JSON_CACHE) >= _JSON_CACHE_MAX:
+                _JSON_CACHE.clear()
+            _JSON_CACHE[key] = payload
+        return payload
+
+    def _build_json(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "source": self.source,
@@ -242,6 +263,20 @@ class GameMap:
             "tiles": base64.b64encode(self.tiles).decode("ascii"),
             "analysis": self.analysis(),
         }
+
+
+# Keyed by (path, mtime, size), so editing or replacing a map file is picked up
+# on the next read without any explicit invalidation.
+_JSON_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
+_JSON_CACHE_MAX = 4096
+
+
+def _file_identity(path: Path) -> tuple[str, int, int] | None:
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (str(path), info.st_mtime_ns, info.st_size)
 
 
 def _empty(path: Path, source: str = "official") -> GameMap:
@@ -316,7 +351,7 @@ def _discover_one(directory: Path, source: str) -> list[GameMap]:
         return []
     return [
         parse(path, source=source)
-        for path in sorted(directory.glob(f"*{MAP_SUFFIX}"))
+        for path in sorted(directory.rglob(f"*{MAP_SUFFIX}"))
         if path.is_file()
     ]
 
@@ -359,15 +394,30 @@ def resolve(
         candidates.extend(
             ((extra / text, "extra"), (extra / f"{text}{MAP_SUFFIX}", "extra"))
         )
-    candidates.extend(
-        (
-            (Path(text).expanduser(), "custom"),
-            (Path(f"{text}{MAP_SUFFIX}").expanduser(), "custom"),
-        )
-    )
     for candidate, source in candidates:
         if candidate.is_file():
             return parse(candidate, source=source)
+
+    # Bare names also resolve inside provenance/batch subdirectories.
+    if Path(text).name == text:
+        filename = text if text.endswith(MAP_SUFFIX) else f"{text}{MAP_SUFFIX}"
+        roots = [(directory, "official")]
+        if extra_maps_dir is not None:
+            roots.append((Path(extra_maps_dir), "extra"))
+        for root, source in roots:
+            matches = sorted(path for path in root.rglob(filename) if path.is_file())
+            if len(matches) > 1:
+                paths = ", ".join(str(path) for path in matches)
+                raise MapError(f"ambiguous map {text!r}: {paths}")
+            if matches:
+                return parse(matches[0], source=source)
+
+    for candidate in (
+        Path(text).expanduser(),
+        Path(f"{text}{MAP_SUFFIX}").expanduser(),
+    ):
+        if candidate.is_file():
+            return parse(candidate, source="custom")
 
     known = ", ".join(m.name for m in discover(directory, extra_maps_dir))
     searched = f"{directory} and {extra_maps_dir}" if extra_maps_dir is not None else str(directory)

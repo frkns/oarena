@@ -138,11 +138,15 @@
 
   const bridgeState = {
     loadHandler: null,
+    prepareHandler: null,
+    hasPreparedHandler: null,
     themeHandler: null,
     visibilityHandler: null,
     pendingLoad: null,
     loadSerial: 0,
     loadController: null,
+    prepareSerial: 0,
+    prepareController: null,
     applyChain: Promise.resolve(),
     readySent: false,
     visible: true,
@@ -199,10 +203,12 @@
     const { requestId, game, key } = message;
     postParent("oarena:square:loading", requestId);
     try {
-      const [replay, metadata] = await Promise.all([
-        replayBytes(message, signal),
+      const hasPrepared = bridgeState.hasPreparedHandler?.(key) === true;
+      const [initialReplay, metadata] = await Promise.all([
+        hasPrepared ? null : replayBytes(message, signal),
         metadataForGame(game),
       ]);
+      let replay = initialReplay;
       if (serial !== bridgeState.loadSerial) return;
 
       const apply = async () => {
@@ -211,6 +217,13 @@
         if (!loadHandler) {
           bridgeState.pendingLoad = { message, serial, signal };
           return;
+        }
+        if (
+          replay === null &&
+          bridgeState.hasPreparedHandler?.(key) !== true
+        ) {
+          replay = await replayBytes(message, signal);
+          if (serial !== bridgeState.loadSerial || signal.aborted) return;
         }
         // Never allow a replay without provenance to inherit the previous
         // game's recorded constants. Install metadata only in the serialized
@@ -222,7 +235,14 @@
 
         const theme = validTheme(message.theme);
         if (theme) bridgeState.themeHandler?.(theme);
-        const loaded = await loadHandler({ requestId, replay, game, theme, key });
+        const loaded = await loadHandler({
+          requestId,
+          replay,
+          game,
+          metadata,
+          theme,
+          key,
+        });
         if (serial === bridgeState.loadSerial) {
           postParent("oarena:square:loaded", requestId, null, {
             profilerRecords: Array.isArray(loaded?.profilerRecords)
@@ -249,6 +269,7 @@
   function queueBridgeLoad(message) {
     const serial = ++bridgeState.loadSerial;
     bridgeState.loadController?.abort();
+    cancelBridgePrepare();
     const controller = new AbortController();
     bridgeState.loadController = controller;
     if (bridgeState.loadHandler) {
@@ -256,6 +277,71 @@
     } else {
       bridgeState.pendingLoad = { message, serial, signal: controller.signal };
     }
+  }
+
+  function cancelBridgePrepare() {
+    bridgeState.prepareSerial += 1;
+    bridgeState.prepareController?.abort();
+    bridgeState.prepareController = null;
+  }
+
+  async function runBridgePrepare(message, serial, signal) {
+    const { requestId, game, key } = message;
+    try {
+      const [replay, metadata] = await Promise.all([
+        replayBytes(message, signal),
+        metadataForGame(game),
+      ]);
+      if (serial !== bridgeState.prepareSerial || signal.aborted) return;
+      const prepareHandler = bridgeState.prepareHandler;
+      if (!prepareHandler) throw new Error("Square viewer prepare handler is unavailable");
+      const prepared = await prepareHandler({
+        requestId,
+        replay,
+        game,
+        metadata,
+        key,
+        retainKeys: Array.isArray(message.retainKeys)
+          ? message.retainKeys
+              .filter((value) => typeof value === "string" && value.length <= 200)
+              .slice(0, 5)
+          : [],
+        warmTimeSeries: message.warmTimeSeries === true,
+      });
+      if (serial === bridgeState.prepareSerial && !signal.aborted) {
+        postParent("oarena:square:prepared", requestId, null, {
+          key,
+          prepared: prepared?.prepared === true,
+          profilerRecords: Array.isArray(prepared?.profilerRecords)
+            ? prepared.profilerRecords
+            : [],
+        });
+      }
+    } catch (error) {
+      if (
+        serial === bridgeState.prepareSerial &&
+        !signal.aborted &&
+        error?.name !== "AbortError"
+      ) {
+        const detail = error instanceof Error ? error.message : String(error);
+        postParent(
+          "oarena:square:prepare-error",
+          requestId,
+          detail || "Replay preparation failed",
+          { key },
+        );
+      }
+    } finally {
+      if (serial === bridgeState.prepareSerial) bridgeState.prepareController = null;
+    }
+  }
+
+  function queueBridgePrepare(message) {
+    const serial = ++bridgeState.prepareSerial;
+    bridgeState.prepareController?.abort();
+    const controller = new AbortController();
+    bridgeState.prepareController = controller;
+    void runBridgePrepare(message, serial, controller.signal);
   }
 
   function extractProfilerReports(text) {
@@ -300,7 +386,13 @@
 
   const squareBridge = Object.freeze({
     extractProfilerReports,
-    connect(loadHandler, themeHandler, visibilityHandler) {
+    connect(
+      loadHandler,
+      themeHandler,
+      visibilityHandler,
+      prepareHandler,
+      hasPreparedHandler,
+    ) {
       if (typeof loadHandler !== "function") {
         throw new TypeError("Square viewer load handler must be a function");
       }
@@ -309,6 +401,10 @@
         typeof themeHandler === "function" ? themeHandler : null;
       bridgeState.visibilityHandler =
         typeof visibilityHandler === "function" ? visibilityHandler : null;
+      bridgeState.prepareHandler =
+        typeof prepareHandler === "function" ? prepareHandler : null;
+      bridgeState.hasPreparedHandler =
+        typeof hasPreparedHandler === "function" ? hasPreparedHandler : null;
       bridgeState.visibilityHandler?.(bridgeState.visible);
       if (!bridgeState.readySent) {
         bridgeState.readySent = true;
@@ -320,6 +416,8 @@
       return () => {
         if (bridgeState.loadHandler === loadHandler) {
           bridgeState.loadHandler = null;
+          bridgeState.prepareHandler = null;
+          bridgeState.hasPreparedHandler = null;
           bridgeState.themeHandler = null;
           bridgeState.visibilityHandler = null;
         }
@@ -359,7 +457,13 @@
       }
       return;
     }
-    if (message.type !== "oarena:square:load") return;
+    if (message.type === "oarena:square:cancel-prepare") {
+      cancelBridgePrepare();
+      return;
+    }
+    const loadMessage = message.type === "oarena:square:load";
+    const prepareMessage = message.type === "oarena:square:prepare";
+    if (!loadMessage && !prepareMessage) return;
     if (!validRequestId(message.requestId)) return;
     const key =
       typeof message.key === "string" &&
@@ -379,13 +483,16 @@
       Array.isArray(message.game)
     ) {
       postParent(
-        "oarena:square:error",
+        prepareMessage ? "oarena:square:prepare-error" : "oarena:square:error",
         message.requestId,
-        "Invalid Square replay load message",
+        prepareMessage
+          ? "Invalid Square replay prepare message"
+          : "Invalid Square replay load message",
       );
       return;
     }
-    queueBridgeLoad(message);
+    if (prepareMessage) queueBridgePrepare(message);
+    else queueBridgeLoad(message);
   });
 
 })();

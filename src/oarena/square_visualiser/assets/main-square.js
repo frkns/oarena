@@ -825,6 +825,8 @@ class dl {
   precomputeFrom = 0;
   disposed = !1;
   timeSeriesCache = new Map();
+  timeSeriesHandle = null;
+  timeSeriesJob = null;
   constructor(t, n, r, s, o, i = !0) {
     ((this.map = t),
       (this.rawTurnUpdates = n),
@@ -849,6 +851,7 @@ class dl {
     );
   }
   computeTimeSeries(t) {
+    if (this.timeSeriesJob) this.pauseTimeSeries();
     const cached = this.timeSeriesCache.get(t);
     if (cached) return cached;
     const n = this.totalTurns + 1,
@@ -880,6 +883,94 @@ class dl {
       this.timeSeriesCache.set(t, s),
       s
     );
+  }
+  computeTimeSeriesAsync(t) {
+    const cached = this.timeSeriesCache.get(t);
+    if (cached) return Promise.resolve(cached);
+    if (this.timeSeriesJob && this.timeSeriesJob.target === t)
+      return this.timeSeriesJob.promise;
+    if (this.timeSeriesJob) this.pauseTimeSeries();
+    const n = this.totalTurns + 1,
+      r = () => Array.from({ length: n }),
+      o = {
+        titaniumA: r(),
+        titaniumB: r(),
+        ammoA: r(),
+        ammoB: r(),
+        titaniumCollectedA: r(),
+        titaniumCollectedB: r(),
+        scaleA: r(),
+        scaleB: r(),
+        harvestersA: r(),
+        harvestersB: r(),
+      };
+    const s = at(this.keyframes.get(0)),
+      i = {
+        target: t,
+        turn: 1,
+        state: s,
+        series: o,
+        resolve: () => {},
+        reject: () => {},
+      };
+    this.extractTurnData(o, s, 0, t);
+    const a = new Promise((u, l) => {
+      i.resolve = u;
+      i.reject = l;
+    });
+    i.promise = a;
+    this.timeSeriesJob = { ...i };
+    this.scheduleTimeSeriesChunk();
+    return a;
+  }
+  scheduleTimeSeriesChunk() {
+    if (this.disposed) return;
+    const n = this.timeSeriesJob;
+    if (!n) return;
+    if (typeof requestIdleCallback < "u")
+      this.timeSeriesHandle = requestIdleCallback((r) => this.stepTimeSeriesChunk(r), {
+        timeout: 2e3,
+      });
+    else this.timeSeriesHandle = setTimeout(() => this.stepTimeSeriesChunk(), 16);
+  }
+  stepTimeSeriesChunk(n) {
+    const o = this.timeSeriesJob;
+    if (!o || this.disposed) return;
+    this.timeSeriesHandle = null;
+    const r = n ? () => n.timeRemaining() > 5 : () => !0;
+    for (; o.turn <= this.totalTurns && r(); o.turn += 1) {
+      const s = o.turn;
+      ((o.state.turn = s), vr(o.state));
+      const i = this.rawTurnUpdates[s];
+      (i && i.length > 0 && Kt(o.state, i),
+        this.extractTurnData(o.series, o.state, s, o.target),
+        s % Ut === 0 &&
+          !this.keyframes.has(s) &&
+          this.keyframes.set(s, at(o.state)));
+    }
+    if (o.turn <= this.totalTurns) {
+      this.scheduleTimeSeriesChunk();
+      return;
+    }
+    this.precomputeFrom = this.totalTurns;
+    this.pauseBackgroundPrecompute();
+    this.timeSeriesCache.set(o.target, o.series);
+    const s = o.series;
+    const u = this.timeSeriesJob;
+    this.timeSeriesJob = null;
+    u.resolve(s);
+  }
+  pauseTimeSeries() {
+    if (this.timeSeriesHandle !== null) {
+      typeof cancelIdleCallback < "u"
+        ? cancelIdleCallback(this.timeSeriesHandle)
+        : clearTimeout(this.timeSeriesHandle);
+    }
+    this.timeSeriesHandle = null;
+    if (this.timeSeriesJob?.reject) {
+      this.timeSeriesJob.reject(new Error("Replay time series precompute cancelled"));
+    }
+    this.timeSeriesJob = null;
   }
   extractTurnData(t, n, r, s) {
     ((t.titaniumA[r] = n.players[0].titanium),
@@ -973,6 +1064,11 @@ class dl {
     if (this.disposed) return;
     this.disposed = !0;
     this.pauseBackgroundPrecompute();
+    this.pauseTimeSeries();
+    if (this.timeSeriesJob?.reject) {
+      this.timeSeriesJob.reject(new Error("Replay disposed"));
+      this.timeSeriesJob = null;
+    }
     this.timeSeriesCache.clear();
   }
 }
@@ -3053,13 +3149,23 @@ function Vo({
   const [A, j] = m.useState(null);
   m.useEffect(() => {
     j(null);
-    if (!e) {
+    if (!e) return;
+    const cached = e.timeSeriesCache?.get(Ko);
+    if (cached) {
+      j(cached);
       return;
     }
-    const W = requestAnimationFrame(() => {
-      j(e.computeTimeSeries(Ko));
-    });
-    return () => cancelAnimationFrame(W);
+    let active = !0;
+    const W = setTimeout(() => {
+      e
+        .computeTimeSeriesAsync(Ko)
+        .then((y) => active && j(y))
+        .catch(() => {});
+    }, 16);
+    return () => {
+      active = !1;
+      clearTimeout(W);
+    };
   }, [e]);
   const $ = m.useMemo(() => (o ? Al(o) : null), [o]),
     P = m.useMemo(() => {
@@ -11158,10 +11264,22 @@ function jf({
     if (!n) {
       return;
     }
-    const le = requestAnimationFrame(() => {
-      K(n.computeTimeSeries(Ko));
-    });
-    return () => cancelAnimationFrame(le);
+    const cached = n.timeSeriesCache?.get(Ko);
+    if (cached) {
+      K(cached);
+      return;
+    }
+    let active = !0;
+    const le = setTimeout(() => {
+      n
+        .computeTimeSeriesAsync(Ko)
+        .then((y) => active && K(y))
+        .catch(() => {});
+    }, 16);
+    return () => {
+      active = !1;
+      clearTimeout(le);
+    };
   }, [n]);
   const Fe = m.useMemo(() => {
       const le = b ? F?.titaniumB : F?.titaniumA,
@@ -11547,6 +11665,9 @@ function extractOarenaProfilerRecords(replay) {
   return reports;
 }
 
+const OARENA_PREPARED_REPLAY_LIMIT = 4;
+const OARENA_PREPARED_REPLAY_BYTE_BUDGET = 64 * 1024 * 1024;
+
 function kp({
   initialMatchId: e,
   initialGameNumber: t,
@@ -11589,6 +11710,10 @@ function kp({
     [Ke, Ye] = m.useState(new Set()),
     [activeTheme, setActiveTheme] = m.useState(initialTheme),
     replayRef = m.useRef(null),
+    preparedReplays = m.useRef(new Map()),
+    preparedReplayBytes = m.useRef(0),
+    activeReplayKey = m.useRef(null),
+    activeReplayBytes = m.useRef(0),
     loadGeneration = m.useRef(0),
     viewerVisible = m.useRef(!0),
     pe = oe?.games.find((_) => _.gameNumber === Fe)?.swapCores ?? !1,
@@ -11600,20 +11725,98 @@ function kp({
     Se = m.useCallback(() => {
       (Pe(), L(!1));
     }, [Pe]),
+    prunePreparedReplays = m.useCallback((retainKeys) => {
+      const retain = new Set(
+        Array.isArray(retainKeys) ? retainKeys.map((key) => String(key)) : [],
+      );
+      for (const [key, entry] of preparedReplays.current) {
+        if (retain.has(key)) continue;
+        preparedReplays.current.delete(key);
+        preparedReplayBytes.current = Math.max(
+          0,
+          preparedReplayBytes.current - entry.encodedBytes,
+        );
+        entry.replay.dispose();
+      }
+    }, []),
+    takePreparedReplay = m.useCallback((key) => {
+      const entry = preparedReplays.current.get(key);
+      if (!entry) return null;
+      preparedReplays.current.delete(key);
+      preparedReplayBytes.current = Math.max(
+        0,
+        preparedReplayBytes.current - entry.encodedBytes,
+      );
+      return entry;
+    }, []),
+    storePreparedReplay = m.useCallback((key, replay, encodedBytes) => {
+      if (!key || !replay) return !1;
+      const bytes = Number.isSafeInteger(encodedBytes) && encodedBytes > 0
+        ? encodedBytes
+        : 0;
+      const existing = preparedReplays.current.get(key);
+      if (existing?.replay === replay) return !0;
+      if (existing) {
+        preparedReplays.current.delete(key);
+        preparedReplayBytes.current = Math.max(
+          0,
+          preparedReplayBytes.current - existing.encodedBytes,
+        );
+        existing.replay.dispose();
+      }
+      if (
+        bytes > OARENA_PREPARED_REPLAY_BYTE_BUDGET ||
+        preparedReplays.current.size >= OARENA_PREPARED_REPLAY_LIMIT ||
+        preparedReplayBytes.current + bytes > OARENA_PREPARED_REPLAY_BYTE_BUDGET
+      ) {
+        replay.dispose();
+        return !1;
+      }
+      preparedReplays.current.set(key, { replay, encodedBytes: bytes });
+      preparedReplayBytes.current += bytes;
+      return !0;
+    }, []),
     He = m.useCallback(
-      (_, V = !1) => {
+      (_, V = !1, options = {}) => {
         const Ce = ++loadGeneration.current;
-        if (!(_ instanceof ArrayBuffer))
-          return Promise.reject(new Error("Replay bytes are required"));
-        const Ee = fl(_, !0);
-        Ee.profilerRecords = extractOarenaProfilerRecords(Ee);
+        const replayKey =
+          typeof options.key === "string" && options.key ? options.key : null;
+        let prepared = null,
+          Ee = null,
+          encodedBytes = 0;
+        if (replayKey && activeReplayKey.current === replayKey && replayRef.current) {
+          Ee = replayRef.current;
+          encodedBytes = activeReplayBytes.current;
+        } else if (replayKey) {
+          prepared = takePreparedReplay(replayKey);
+          if (prepared) {
+            Ee = prepared.replay;
+            encodedBytes = prepared.encodedBytes;
+          }
+        }
+        if (!Ee) {
+          if (!(_ instanceof ArrayBuffer))
+            return Promise.reject(new Error("Replay bytes are required"));
+          Ee = fl(_, !0, options.metadata);
+          Ee.profilerRecords = extractOarenaProfilerRecords(Ee);
+          encodedBytes = _.byteLength;
+        }
 
         const ut = replayRef.current;
         if (ut && ut !== Ee) {
           ut.pauseBackgroundPrecompute();
-          ut.dispose();
+          const parked = activeReplayKey.current
+            ? storePreparedReplay(
+                activeReplayKey.current,
+                ut,
+                activeReplayBytes.current,
+              )
+            : !1;
+          if (!parked) ut.dispose();
         }
         ((replayRef.current = Ee),
+          (activeReplayKey.current = replayKey),
+          (activeReplayBytes.current = encodedBytes),
           Ee.startBackgroundPrecompute(),
           Pe(),
           L(!1),
@@ -11668,7 +11871,7 @@ function kp({
           });
         });
       },
-      [de, u, Pe],
+      [de, u, Pe, storePreparedReplay, takePreparedReplay],
     );
   const handleBridgeTheme = m.useCallback((_) => {
       (_ === "light" || _ === "dark") && setActiveTheme(_);
@@ -11692,7 +11895,7 @@ function kp({
       [Se],
     ),
     handleBridgeLoad = m.useCallback(
-      async ({ replay: _, game: V, theme: ke, key: Ce }) => {
+      async ({ replay: _, game: V, metadata, theme: ke, key: Ce }) => {
         ke && handleBridgeTheme(ke);
         je({
           match: {
@@ -11709,7 +11912,7 @@ function kp({
             ? `Game ${V.id ?? Ce} — ${V.map}`
             : `Game ${V?.id ?? Ce ?? "replay"}`,
         );
-        const Ee = await He(_, !1);
+        const Ee = await He(_, !1, { key: Ce, metadata });
         if (!Ee?.superseded && !viewerVisible.current) {
           const ut = h.current?.getScene(),
             rt = h.current?.getGame();
@@ -11724,7 +11927,54 @@ function kp({
         };
       },
       [He, handleBridgeTheme],
-    );
+    ),
+    handleBridgePrepare = m.useCallback(
+      async ({ replay: _, metadata, key: V, retainKeys, warmTimeSeries }) => {
+        if (typeof V !== "string" || !V || !(_ instanceof ArrayBuffer)) {
+          throw new Error("Replay bytes and cache key are required");
+        }
+        prunePreparedReplays(retainKeys);
+        if (activeReplayKey.current === V && replayRef.current) {
+          if (warmTimeSeries) replayRef.current.computeTimeSeriesAsync(Ko).catch(() => {});
+          return {
+            prepared: !0,
+            profilerRecords: replayRef.current.profilerRecords ?? [],
+          };
+        }
+        const cached = preparedReplays.current.get(V);
+        if (cached) {
+          if (warmTimeSeries) cached.replay.computeTimeSeriesAsync(Ko).catch(() => {});
+          return {
+            prepared: !0,
+            profilerRecords: cached.replay.profilerRecords ?? [],
+          };
+        }
+        if (
+          _.byteLength > OARENA_PREPARED_REPLAY_BYTE_BUDGET ||
+          preparedReplays.current.size >= OARENA_PREPARED_REPLAY_LIMIT ||
+          preparedReplayBytes.current + _.byteLength >
+            OARENA_PREPARED_REPLAY_BYTE_BUDGET
+        ) {
+          return { prepared: !1, profilerRecords: [] };
+        }
+        const decoded = fl(_, !1, metadata);
+        decoded.profilerRecords = extractOarenaProfilerRecords(decoded);
+        if (warmTimeSeries) decoded.computeTimeSeriesAsync(Ko).catch(() => {});
+        const stored = storePreparedReplay(V, decoded, _.byteLength);
+        return {
+          prepared: stored,
+          profilerRecords: stored ? decoded.profilerRecords : [],
+        };
+      },
+      [prunePreparedReplays, storePreparedReplay],
+    ),
+    handleBridgeHasPrepared = m.useCallback((key) => {
+      if (typeof key !== "string" || !key) return !1;
+      return (
+        (activeReplayKey.current === key && replayRef.current !== null) ||
+        preparedReplays.current.has(key)
+      );
+    }, []);
   m.useEffect(() => {
     const _ = globalThis.__OARENA_SQUARE_BRIDGE__;
     if (!_?.connect || !h.current) return;
@@ -11737,6 +11987,8 @@ function kp({
             handleBridgeLoad,
             handleBridgeTheme,
             handleBridgeVisibility,
+            handleBridgePrepare,
+            handleBridgeHasPrepared,
           ));
       }),
       () => {
@@ -11745,6 +11997,8 @@ function kp({
     );
   }, [
     handleBridgeLoad,
+    handleBridgePrepare,
+    handleBridgeHasPrepared,
     handleBridgeTheme,
     handleBridgeVisibility,
   ]);
@@ -11753,8 +12007,11 @@ function kp({
       (loadGeneration.current++, Pe());
       replayRef.current?.dispose();
       replayRef.current = null;
+      activeReplayKey.current = null;
+      activeReplayBytes.current = 0;
+      prunePreparedReplays([]);
     },
-    [Pe],
+    [Pe, prunePreparedReplays],
   );
   (m.useEffect(() => {
     const _ = window.matchMedia("(hover: hover) and (pointer: fine)"),

@@ -17,7 +17,7 @@ import pytest
 from conftest import Project, write_bot
 from fake_worker import FAKE_FCODE_METADATA, FAKE_FCODE_VERSION
 from oarena.bots import BotError
-from oarena.league import Job, League, SyncReport
+from oarena.league import MAX_GAME_SEED, Job, League, SyncReport
 from oarena.runner import GameOutcome, GameSpec, PlayerResult
 from oarena.store import Store, StoreBatchError, StoreBusyError
 
@@ -195,6 +195,30 @@ def test_sync_refreshes_a_moved_bot_directory(project: Project) -> None:
     assert bot.dir == str(project.cfg.bots_dir / "alpha")
 
 
+def test_sync_and_plan_with_a_mounted_bot_catalog(
+    project: Project, tmp_path: Path
+) -> None:
+    external = tmp_path / "pantheon-bots"
+    write_bot(external, "Heimdall_v6")
+    (project.cfg.bots_dir / "pantheon").symlink_to(
+        external, target_is_directory=True
+    )
+
+    report = project.league.sync()
+    source = project.league.resolve("Heimdall_v6")
+    jobs = project.league.plan_match(
+        "alpha", "Heimdall_v6", maps=["sprint"], mirror=True
+    )
+
+    assert "Heimdall_v6" in report.added
+    assert source.dir == project.cfg.bots_dir / "pantheon" / "Heimdall_v6"
+    assert len(jobs) == 2
+    assert {(job.a, job.b) for job in jobs} == {
+        ("alpha", "Heimdall_v6"),
+        ("Heimdall_v6", "alpha"),
+    }
+
+
 def test_resolve_syncs_on_a_miss(project: Project) -> None:
     project.add_bot("delta")
     src = project.league.resolve("delta")
@@ -300,6 +324,76 @@ def test_plan_match_uses_random_seeds_by_default(project: Project) -> None:
     seeds = {j.seed for j in jobs}
     assert len(seeds) > 1
     assert all(1 <= s < 2**31 for s in seeds)
+
+
+def test_plan_match_accepts_a_per_run_custom_base_seed(project: Project) -> None:
+    jobs = project.league.plan_match(
+        "alpha",
+        "beta",
+        maps=["sprint", "duel"],
+        repeat=2,
+        mirror=True,
+        seed_policy="fixed",
+        seed=0,
+    )
+
+    assert [job.seed for job in jobs] == [0, 0, 0, 0, 1, 1, 1, 1]
+
+
+def test_plan_match_preserves_a_large_fixed_project_seed(project: Project) -> None:
+    cfg = dataclasses.replace(
+        project.cfg,
+        seed_policy="fixed",
+        seed=20_260_802_001,
+        mirror=False,
+    )
+    league = League(cfg, project.store, project.bus, project.rater)
+
+    jobs = league.plan_match("alpha", "beta", maps=["sprint"], repeat=2)
+
+    assert [job.seed for job in jobs] == [20_260_802_001, 20_260_802_002]
+
+
+def test_plan_match_can_override_a_fixed_project_with_random_seeds(
+    project: Project, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = dataclasses.replace(project.cfg, seed_policy="fixed", seed=100)
+    league = League(cfg, project.store, project.bus, project.rater)
+    generated = iter((7, 8, 9, 10))
+    monkeypatch.setattr(league, "_random_seed", lambda: next(generated))
+
+    jobs = league.plan_match(
+        "alpha",
+        "beta",
+        maps=["sprint", "duel"],
+        repeat=2,
+        mirror=False,
+        seed_policy="random",
+    )
+
+    assert [job.seed for job in jobs] == [7, 8, 9, 10]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"seed_policy": "fixed"}, "requires a seed"),
+        ({"seed_policy": "random", "seed": 1}, "cannot include"),
+        ({"seed_policy": "fixed", "seed": -1}, "must stay"),
+        (
+            {"seed_policy": "fixed", "seed": MAX_GAME_SEED, "repeat": 2},
+            "must stay",
+        ),
+        ({"seed_policy": "sometimes"}, "seed_policy"),
+    ],
+)
+def test_plan_match_rejects_invalid_seed_overrides(
+    project: Project, kwargs: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        project.league.plan_match(
+            "alpha", "beta", maps=["sprint"], mirror=False, **kwargs
+        )
 
 
 def test_plan_match_uses_the_config_mirror_default(project: Project) -> None:
@@ -506,6 +600,16 @@ def test_a_vs_arena_keeps_matching_a_broken_target(project: Project) -> None:
     assert all("beta" in (game.a, game.b) for game in games)
     assert all(game.rated and game.a_errors + game.b_errors == 1 for game in games)
     assert project.store.get_bot("beta").broken is True  # type: ignore[union-attr]
+
+
+def test_a_vs_arena_rejects_a_disabled_target(project: Project) -> None:
+    project.league.sync()
+    project.store.set_active("beta", False)
+
+    with pytest.raises(ValueError, match="disabled"):
+        project.league.start_arena("vs", target="beta")
+
+    assert project.league.running is False
 
 
 def test_an_unknown_matchmaker_is_rejected_before_the_thread_starts(project: Project) -> None:

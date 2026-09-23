@@ -19,6 +19,7 @@ import ipaddress
 import json
 import math
 import os
+import re
 import socket
 import stat
 import threading
@@ -26,8 +27,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -40,8 +43,38 @@ _DEFAULT_REPLAY_CACHE_BYTES = 64 << 20
 _MAX_CACHE_ENTRIES = 128
 _MAX_BEARER_CHARS = 8192
 _MAX_TEST_RUN_ERROR_CHARS = 1000
+_MAX_POST_ERROR_BYTES = 16 << 10
+_MAX_RETRY_AFTER_S = 7 * 24 * 60 * 60
+_MAX_TEAM_QUERY_CHARS = 200
+_MAX_MAP_NAME_CHARS = 200
 _MAX_SYSTEMD_CREDENTIAL_BYTES = 64 << 10
 _SYSTEMD_CREDENTIAL_FILE = "fcode_credentials.json"
+_SHARED_MATCH_RATE_LIMIT_ERROR = (
+    "Rate limit exceeded: max 5 test/unrated matches per 10 minutes"
+)
+_MAX_RATE_LIMIT_MESSAGE_CHARS = 200
+# FCode returns its shared unrated-match quota as a plain 400 whose wording (and
+# numbers) change whenever the organisers retune the limit. Match the *shape* of
+# the sentence rather than one frozen string, so a retuned quota keeps being
+# recognised as a routine cooldown instead of a hard rejection.
+_RATE_LIMIT_SHAPE = re.compile(
+    r"rate[\s_-]*limit|too\s+many\s+(?:requests|matches|scrims)|quota\s+exceeded",
+    re.IGNORECASE,
+)
+_RATE_LIMIT_QUOTA = re.compile(
+    r"(\d{1,4})\s*(?:[\w/\-]+\s+){0,4}?per\s*(\d{1,4})?\s*"
+    r"(second|sec|minute|min|hour|hr|day)s?\b",
+    re.IGNORECASE,
+)
+_RATE_LIMIT_UNITS = {
+    "second": 1.0,
+    "sec": 1.0,
+    "minute": 60.0,
+    "min": 60.0,
+    "hour": 3600.0,
+    "hr": 3600.0,
+    "day": 86400.0,
+}
 _REPLAY_HOSTS = frozenset(
     {"florentcode-production-replays.s3.eu-north-1.amazonaws.com"}
 )
@@ -50,10 +83,19 @@ _REPLAY_HOSTS = frozenset(
 class PlatformError(Exception):
     """A safe platform failure carrying the status oarena should return."""
 
-    def __init__(self, code: int, message: str) -> None:
+    def __init__(
+        self,
+        code: int,
+        message: str,
+        *,
+        retry_after_s: int | None = None,
+        outcome_unknown: bool = False,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.retry_after_s = retry_after_s
+        self.outcome_unknown = outcome_unknown
 
 
 @dataclasses.dataclass(frozen=True)
@@ -291,6 +333,163 @@ def _bearer_token(value: Any) -> str | None:
     return value
 
 
+def _canonical_uuid(value: Any, name: str) -> str:
+    if not isinstance(value, str) or len(value) != 36:
+        raise PlatformError(400, f"{name} must be a canonical UUID")
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError as exc:
+        raise PlatformError(400, f"{name} must be a canonical UUID") from exc
+    if value != str(parsed):
+        raise PlatformError(400, f"{name} must be a canonical UUID")
+    return value
+
+
+def _bounded_int(value: Any, name: str, low: int, high: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PlatformError(400, f"{name} must be an integer")
+    if not low <= value <= high:
+        raise PlatformError(400, f"{name} must be between {low} and {high}")
+    return value
+
+
+def _required_input_text(value: Any, name: str, limit: int) -> str:
+    if not isinstance(value, str):
+        raise PlatformError(400, f"{name} is invalid")
+    if any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value):
+        raise PlatformError(400, f"{name} is invalid")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise PlatformError(400, f"{name} is invalid") from exc
+    value = value.strip()
+    if not value or len(value) > limit:
+        raise PlatformError(400, f"{name} is invalid")
+    return value
+
+
+def _map_names(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        raise PlatformError(400, "map_names must be a list")
+    if len(value) > 5:
+        raise PlatformError(400, "map_names may contain at most 5 maps")
+    return [
+        _required_input_text(item, "map name", _MAX_MAP_NAME_CHARS)
+        for item in value
+    ]
+
+
+def _submission(raw: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": _safe_text(raw.get("id"), limit=128),
+        "version": _safe_int(raw.get("version")),
+        "name": _safe_text(raw.get("name"), limit=200),
+        "status": _safe_text(raw.get("status"), limit=32),
+        "uploaded_at": _safe_text(raw.get("uploadedAt"), limit=64),
+    }
+
+
+def _search_team(raw: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": _safe_text(raw.get("teamId"), limit=128),
+        "name": _safe_text(raw.get("teamName"), limit=200),
+        "rating": _safe_number(raw.get("rating")),
+        "matches_played": _safe_int(raw.get("matchesPlayed")),
+    }
+
+
+def rate_limit_quota(message: Any) -> tuple[int, float] | None:
+    """Parse "max N per M minutes" out of a quota sentence.
+
+    Returns ``(allowance, window_seconds)`` so callers can pace themselves
+    against whatever limit FCode currently advertises instead of a number
+    hard-coded when the tool was written.
+    """
+    if not isinstance(message, str):
+        return None
+    found = _RATE_LIMIT_QUOTA.search(" ".join(message.split()))
+    if found is None:
+        return None
+    try:
+        allowance = int(found.group(1))
+        count = int(found.group(2)) if found.group(2) else 1
+    except ValueError:
+        return None
+    unit = _RATE_LIMIT_UNITS.get(found.group(3).casefold())
+    if unit is None or count <= 0 or not 0 < allowance <= 1000:
+        return None
+    window = count * unit
+    if not 0 < window <= _MAX_RETRY_AFTER_S:
+        return None
+    return allowance, window
+
+
+def rate_limit_window_seconds(message: Any) -> float | None:
+    """Return the cooldown a quota sentence implies, or None if it states none."""
+    quota = rate_limit_quota(message)
+    return None if quota is None else quota[1]
+
+
+def _shared_match_rate_limit(value: Any) -> str | None:
+    """Recognize an upstream 400 that is really the shared unrated-match quota.
+
+    FCode has changed both the numbers and the wording of this message before,
+    and matching one frozen string turned an ordinary cooldown into a hard
+    rejection that stopped autoscrim -- the one outcome this must never cause.
+    So the *shape* of the sentence is matched instead, and the returned text is
+    rebuilt from the parsed numbers rather than echoed: upstream bodies may
+    carry platform or bot internals that never belong on the dashboard.
+    """
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    if not text or len(text) > _MAX_RATE_LIMIT_MESSAGE_CHARS:
+        return None
+    if _RATE_LIMIT_SHAPE.search(text) is None:
+        return None
+    quota = rate_limit_quota(text)
+    if quota is None:
+        return "FCode platform rate limit reached"
+    allowance, window = quota
+    return (
+        f"Rate limit exceeded: max {allowance} test/unrated matches "
+        f"per {_format_window(window)}"
+    )
+
+
+def _format_window(window_s: float) -> str:
+    for unit, seconds in (("hour", 3600.0), ("minute", 60.0)):
+        if window_s >= seconds and window_s % seconds == 0:
+            count = int(window_s // seconds)
+            return f"{count} {unit}{'s' if count != 1 else ''}"
+    count = int(round(window_s))
+    return f"{count} second{'s' if count != 1 else ''}"
+
+
+def _retry_after_seconds(headers: Any) -> int | None:
+    if headers is None:
+        return None
+    try:
+        value = headers.get("Retry-After")
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if value.isdecimal():
+        return min(int(value), _MAX_RETRY_AFTER_S)
+    try:
+        retry_at = parsedate_to_datetime(value)
+        if retry_at.tzinfo is None:
+            return None
+        delay = math.ceil(retry_at.timestamp() - time.time())
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return min(max(0, delay), _MAX_RETRY_AFTER_S)
+
+
 def _is_loopback_host(hostname: str) -> bool:
     if hostname.rstrip(".").lower() in {"localhost", "localhost.localdomain"}:
         return True
@@ -448,6 +647,121 @@ class FcodePlatform:
             if team_id or team_name:
                 team = {"id": team_id, "name": team_name}
         return {"authenticated": _bearer_token(token) is not None, "team": team}
+
+    def scrim_profile(self) -> dict[str, Any]:
+        """Return the signed-in team and its currently active submission."""
+        auth = self._require_auth()
+        raw_team = auth.credentials.get("team")
+        if not isinstance(raw_team, Mapping):
+            raise PlatformError(400, "the fcode account is not on a team")
+        team_id = _safe_text(raw_team.get("id"), limit=128)
+        team_name = _safe_text(raw_team.get("name"), limit=200)
+        if not team_id:
+            raise PlatformError(400, "the fcode account is not on a team")
+        path = "/api/submissions"
+        key = f"scrim-profile:{auth.fingerprint}:{path}"
+
+        def load() -> dict[str, Any]:
+            raw = self._request_json(auth, path)
+            raw_submissions = (
+                raw.get("submissions") if isinstance(raw, Mapping) else None
+            )
+            if not isinstance(raw_submissions, list):
+                raise PlatformError(502, "invalid submissions response from FCode")
+            active = next(
+                (
+                    item
+                    for item in raw_submissions
+                    if isinstance(item, Mapping) and item.get("isActive") is True
+                ),
+                None,
+            )
+            return {
+                "team": {"id": team_id, "name": team_name},
+                "active_submission": (
+                    _submission(active) if active is not None else None
+                ),
+            }
+
+        return self._cached_json(key, self._json_ttl_s, load)
+
+    def team_search(self, query: str, *, limit: int = 20) -> dict[str, Any]:
+        auth = self._require_auth()
+        clean_query = _required_input_text(
+            query, "query", _MAX_TEAM_QUERY_CHARS
+        )
+        clean_limit = _bounded_int(limit, "limit", 1, 20)
+        path = "/api/teams/search?" + urllib.parse.urlencode({"q": clean_query})
+        key = f"team-search:{auth.fingerprint}:{clean_query}:{clean_limit}"
+
+        def load() -> dict[str, Any]:
+            raw = self._request_json(auth, path)
+            raw_teams = raw.get("teams") if isinstance(raw, Mapping) else None
+            if not isinstance(raw_teams, list):
+                raise PlatformError(502, "invalid team search response from FCode")
+            teams = [
+                _search_team(item)
+                for item in raw_teams[:clean_limit]
+                if isinstance(item, Mapping)
+            ]
+            return {"teams": teams}
+
+        return self._cached_json(key, self._json_ttl_s, load)
+
+    def platform_maps(self) -> dict[str, Any]:
+        auth = self._require_auth()
+        path = "/api/maps"
+        key = f"platform-maps:{auth.fingerprint}:{path}"
+
+        def load() -> dict[str, Any]:
+            raw = self._request_json(auth, path)
+            raw_maps = raw.get("maps") if isinstance(raw, Mapping) else None
+            if not isinstance(raw_maps, list):
+                raise PlatformError(502, "invalid maps response from FCode")
+            names: list[str] = []
+            for item in raw_maps:
+                if not isinstance(item, Mapping):
+                    continue
+                name = _safe_text(item.get("name"), limit=_MAX_MAP_NAME_CHARS)
+                if name is not None:
+                    names.append(name)
+            return {"maps": names}
+
+        return self._cached_json(key, self._ladder_ttl_s, load)
+
+    def request_unrated(
+        self,
+        opponent_team_id: str,
+        *,
+        source_match_id: str | None = None,
+        map_names: list[str] | tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Queue one unrated match using the account's active submission."""
+        auth = self._require_auth()
+        opponent_id = _canonical_uuid(opponent_team_id, "opponent_team_id")
+        source_id = (
+            None
+            if source_match_id is None
+            else _canonical_uuid(source_match_id, "source_match_id")
+        )
+        names = _map_names(map_names)
+        payload: dict[str, Any] = {"opponentTeamId": opponent_id}
+        if source_id is not None:
+            payload["sourceMatchId"] = source_id
+        if names:
+            payload["mapNames"] = names
+
+        raw = self._request_json_post(auth, "/api/matches/unrated", payload)
+        raw_match_id = raw.get("matchId") if isinstance(raw, Mapping) else None
+        try:
+            match_id = _canonical_uuid(raw_match_id, "match_id")
+        except PlatformError as exc:
+            raise PlatformError(
+                502,
+                "invalid unrated match response from FCode",
+                outcome_unknown=True,
+            ) from exc
+        return {"match_id": match_id}
 
     def matches(
         self,
@@ -697,12 +1011,73 @@ class FcodePlatform:
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise PlatformError(502, "invalid JSON response from FCode") from exc
 
+    def _request_json_post(
+        self, auth: _Auth, path: str, payload: Mapping[str, Any]
+    ) -> Any:
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "oarena-platform-proxy/1",
+        }
+        if auth.token:
+            headers["Authorization"] = f"Bearer {auth.token}"
+        try:
+            encoded = json.dumps(
+                payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise PlatformError(400, "invalid unrated match request") from exc
+        request = urllib.request.Request(
+            auth.base_url + path,
+            data=encoded,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            response = self._open(
+                request,
+                timeout=self._timeout_s,
+                mutation=True,
+            )
+            body = self._read_response(
+                response,
+                limit=_MAX_JSON_BYTES,
+                large_message="FCode JSON response is unexpectedly large",
+            )
+            if len(body) > _MAX_JSON_BYTES:
+                raise PlatformError(
+                    502, "FCode JSON response is unexpectedly large"
+                )
+            try:
+                return json.loads(
+                    body,
+                    parse_constant=_reject_constant,
+                    object_pairs_hook=_reject_duplicate_keys,
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                raise PlatformError(
+                    502, "invalid JSON response from FCode"
+                ) from exc
+        except PlatformError as exc:
+            if exc.outcome_unknown or exc.code < 500:
+                raise
+            raise PlatformError(
+                exc.code,
+                exc.message,
+                retry_after_s=exc.retry_after_s,
+                outcome_unknown=True,
+            ) from exc
+
     def _open(
         self,
         request: urllib.request.Request,
         *,
         timeout: float,
         redirect_policy: str = "reject",
+        mutation: bool = False,
     ) -> BinaryIO:
         try:
             if self._opener is not None:
@@ -713,9 +1088,18 @@ class FcodePlatform:
                 else self._json_opener
             )
             return opener.open(request, timeout=timeout)
-        except PlatformError:
+        except PlatformError as exc:
+            if mutation and exc.code >= 500 and not exc.outcome_unknown:
+                raise PlatformError(
+                    exc.code,
+                    exc.message,
+                    retry_after_s=exc.retry_after_s,
+                    outcome_unknown=True,
+                ) from exc
             raise
         except urllib.error.HTTPError as exc:
+            if mutation:
+                raise self._post_http_error(exc) from exc
             # Do not echo the upstream body: errors may include platform or bot
             # internals and are not needed by the dashboard.
             try:
@@ -729,18 +1113,106 @@ class FcodePlatform:
             if exc.code == 404:
                 raise PlatformError(404, "FCode resource not found") from exc
             if exc.code == 429:
-                raise PlatformError(429, "FCode platform rate limit reached") from exc
+                raise PlatformError(
+                    429,
+                    "FCode platform rate limit reached",
+                    retry_after_s=_retry_after_seconds(getattr(exc, "headers", None)),
+                ) from exc
             if exc.code in {408, 504}:
                 raise PlatformError(504, "FCode platform request timed out") from exc
             raise PlatformError(502, "FCode platform request failed") from exc
         except (TimeoutError, socket.timeout) as exc:
-            raise PlatformError(504, "FCode platform request timed out") from exc
+            raise PlatformError(
+                504,
+                "FCode platform request timed out",
+                outcome_unknown=mutation,
+            ) from exc
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, (TimeoutError, socket.timeout)):
-                raise PlatformError(504, "FCode platform request timed out") from exc
-            raise PlatformError(502, "could not reach the FCode platform") from exc
+                raise PlatformError(
+                    504,
+                    "FCode platform request timed out",
+                    outcome_unknown=mutation,
+                ) from exc
+            raise PlatformError(
+                502,
+                "could not reach the FCode platform",
+                outcome_unknown=mutation,
+            ) from exc
         except OSError as exc:
-            raise PlatformError(502, "could not reach the FCode platform") from exc
+            raise PlatformError(
+                502,
+                "could not reach the FCode platform",
+                outcome_unknown=mutation,
+            ) from exc
+
+    @staticmethod
+    def _post_http_error(exc: urllib.error.HTTPError) -> PlatformError:
+        retry_after_s = _retry_after_seconds(getattr(exc, "headers", None))
+        rate_limit_message: str | None = None
+        try:
+            raw = exc.read(_MAX_POST_ERROR_BYTES + 1)
+            if len(raw) <= _MAX_POST_ERROR_BYTES:
+                decoded = json.loads(
+                    raw,
+                    parse_constant=_reject_constant,
+                    object_pairs_hook=_reject_duplicate_keys,
+                )
+                if isinstance(decoded, Mapping):
+                    rate_limit_message = _shared_match_rate_limit(
+                        decoded.get("error") or decoded.get("message")
+                    )
+        except (
+            OSError,
+            http.client.HTTPException,
+            TypeError,
+            UnicodeDecodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            rate_limit_message = None
+        finally:
+            try:
+                exc.close()
+            except Exception:
+                pass
+
+        status = exc.code
+        if status == 400 and rate_limit_message is not None:
+            status = 429
+        if status == 429:
+            message = rate_limit_message or "FCode platform rate limit reached"
+            if retry_after_s is None:
+                window = rate_limit_window_seconds(message)
+                if window is not None:
+                    retry_after_s = int(math.ceil(window))
+            return PlatformError(429, message, retry_after_s=retry_after_s)
+        if status in {408, 504}:
+            return PlatformError(
+                504,
+                "FCode platform request timed out",
+                retry_after_s=retry_after_s,
+                outcome_unknown=True,
+            )
+        if status >= 500:
+            return PlatformError(
+                502,
+                "FCode platform request failed",
+                retry_after_s=retry_after_s,
+                outcome_unknown=True,
+            )
+        if status == 401:
+            fallback = "FCode session expired; run `fcode login`"
+        elif status == 404:
+            fallback = "FCode resource not found"
+        else:
+            fallback = "FCode rejected unrated match request"
+        safe_status = status if 400 <= status <= 499 else 502
+        return PlatformError(
+            safe_status,
+            fallback,
+            retry_after_s=retry_after_s,
+        )
 
     def _read_response(
         self,

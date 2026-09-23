@@ -58,7 +58,12 @@ from .reporting import game_json
 from .runner import GameOutcome, GameSpec, canonical_fcode_metadata_json
 from .store import Game, Store
 
-__all__ = ["Job", "League", "SyncReport"]
+__all__ = ["MAX_GAME_SEED", "MIN_GAME_SEED", "Job", "League", "SyncReport"]
+
+MIN_GAME_SEED = 0
+# Replays persist seeds in SQLite INTEGER, whose exact positive range ends at
+# signed 64-bit even though the native engine itself accepts unsigned 64-bit.
+MAX_GAME_SEED = 2**63 - 1
 
 TICK_S = 0.25
 """Loop granularity: how long the run thread blocks waiting for a finished game."""
@@ -297,6 +302,8 @@ class League:
         mirror: bool | None = None,
         rated: bool = True,
         tag: str = "match",
+        seed_policy: str | None = None,
+        seed: int | None = None,
     ) -> list[Job]:
         """Build the finite job list for ``a`` vs ``b``.
 
@@ -304,27 +311,46 @@ class League:
         run stopped half way through still says something about every map. With
         ``mirror`` each pairing is played twice on the same map *and seed* with
         the sides swapped, which cancels turn-order bias. A bot matched against
-        itself is always unrated.
+        itself is always unrated. ``seed_policy`` and ``seed`` optionally
+        override the project policy for this plan only; a fixed seed is the
+        first round's base and increments once per later round.
         """
         cfg = self.cfg
         src_a, src_b = self.resolve(a), self.resolve(b)
         chosen = select_maps(cfg.maps_dir, maps, cfg.maps, cfg.extra_maps_dir)
         use_mirror = cfg.mirror if mirror is None else bool(mirror)
         rounds = max(1, int(repeat))
+        policy = cfg.seed_policy if seed_policy is None else str(seed_policy).lower()
+        if policy not in {"fixed", "random"}:
+            raise ValueError("seed_policy must be 'random' or 'fixed'")
+        if seed_policy is not None and policy == "fixed" and seed is None:
+            raise ValueError("a fixed seed policy requires a seed")
+        if policy == "random" and seed is not None:
+            raise ValueError("a random seed policy cannot include a fixed seed")
+        base_seed = cfg.seed if seed is None else seed
+        if policy == "fixed":
+            if isinstance(base_seed, bool) or not isinstance(base_seed, int):
+                raise ValueError("seed must be an integer")
+            final_seed = base_seed + rounds - 1
+            if not MIN_GAME_SEED <= base_seed <= final_seed <= MAX_GAME_SEED:
+                raise ValueError(
+                    f"seed rounds must stay between {MIN_GAME_SEED} and "
+                    f"{MAX_GAME_SEED}"
+                )
         if src_a.name == src_b.name:
             rated = False
 
         jobs: list[Job] = []
         for rnd in range(rounds):
             for game_map in chosen:
-                seed = cfg.seed + rnd if cfg.seed_policy == "fixed" else self._random_seed()
+                game_seed = base_seed + rnd if policy == "fixed" else self._random_seed()
                 map_path = str(game_map.path.resolve())
                 jobs.append(
                     Job(
                         src_a.name,
                         src_b.name,
                         game_map.name,
-                        seed,
+                        game_seed,
                         rated,
                         tag,
                         map_path=map_path,
@@ -336,7 +362,7 @@ class League:
                             src_b.name,
                             src_a.name,
                             game_map.name,
-                            seed,
+                            game_seed,
                             rated,
                             tag,
                             map_path=map_path,
@@ -437,12 +463,17 @@ class League:
                 )
                 reserved = True
             self.sync()
+            if kind == "vs" and target:
+                self.resolve(target)
+                stored_target = self.store.get_bot(target)
+                if stored_target is None or not stored_target.active:
+                    raise ValueError(
+                        f"target bot {target!r} is disabled; enable it before starting an arena"
+                    )
             matchmaker = make_matchmaker(
                 kind, self.store, self.rater, target=target, top=top, rng=self._rng
             )
             mode = "vs" if matchmaker.name == "vs" else "arena"
-            if mode == "vs" and target:
-                self.resolve(target)  # fail now on a typo, not once per idle second
             arena_maps = select_maps(cfg.maps_dir, None, cfg.maps, cfg.extra_maps_dir)
             with self._lock:
                 self._batch_tag = batch_tag

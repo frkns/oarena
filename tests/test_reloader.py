@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
-from conftest import Project
+from conftest import Project, write_bot
 from oarena import reloader, server as servermod
 from oarena.cli import main
 
@@ -242,6 +242,24 @@ def test_polling_watcher_ignores_oarena_state_and_python_cache(
     assert str(db) not in initial
 
 
+def test_polling_watcher_detects_changes_in_a_mounted_bot_catalog(
+    project: Project, tmp_path: Path
+) -> None:
+    upstream = tmp_path / "pantheon-bots"
+    bot = write_bot(upstream, "Heimdall_v6")
+    (project.cfg.bots_dir / "pantheon").symlink_to(
+        upstream,
+        target_is_directory=True,
+    )
+    watcher = reloader.PollingWatcher(project.cfg)
+    initial = watcher.snapshot()
+
+    (bot / "main.py").write_text("CHANGED", encoding="utf-8")
+
+    assert str(bot / "main.py") in initial
+    assert watcher.snapshot() != initial
+
+
 def test_watch_paths_cover_project_oarena_and_fcode(
     project: Project, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -259,6 +277,27 @@ def test_watch_paths_cover_project_oarena_and_fcode(
     assert engine in paths
     assert dist_info in paths
     assert Path(reloader.__file__).resolve().parent in paths
+
+
+def test_watch_paths_include_only_direct_external_bot_mounts(
+    project: Project, tmp_path: Path
+) -> None:
+    direct = tmp_path / "direct-bots"
+    nested = tmp_path / "nested-bots"
+    direct.mkdir()
+    nested.mkdir()
+    (project.cfg.bots_dir / "pantheon").symlink_to(
+        direct,
+        target_is_directory=True,
+    )
+    group = project.cfg.bots_dir / "group"
+    group.mkdir()
+    (group / "nested-link").symlink_to(nested, target_is_directory=True)
+
+    paths = set(reloader.watch_paths(project.cfg))
+
+    assert direct.resolve() in paths
+    assert nested.resolve() not in paths
 
 
 def test_serve_cli_preserves_defaults_and_forwards_reload_options(

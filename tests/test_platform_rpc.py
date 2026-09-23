@@ -29,6 +29,7 @@ from oarena.server import App
 
 MATCH_ID = "123e4567-e89b-42d3-a456-426614174000"
 TEAM_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+OPPONENT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 
 
 class PlatformStub:
@@ -38,6 +39,25 @@ class PlatformStub:
     def session(self) -> dict[str, Any]:
         self.calls.append(("session", None))
         return {"authenticated": True, "team": {"id": TEAM_ID, "name": "Alpha"}}
+
+    def scrim_profile(self) -> dict[str, Any]:
+        self.calls.append(("scrim_profile", None))
+        return {
+            "team": {"id": TEAM_ID, "name": "Alpha"},
+            "active_submission": {"id": "submission", "version": 7},
+        }
+
+    def team_search(self, *, query: str, limit: int) -> dict[str, Any]:
+        self.calls.append(("team_search", {"query": query, "limit": limit}))
+        return {"teams": [{"id": OPPONENT_ID, "name": "Beta"}]}
+
+    def platform_maps(self) -> dict[str, Any]:
+        self.calls.append(("platform_maps", None))
+        return {"maps": ["atoll", "crossfire"]}
+
+    def request_unrated(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("request_unrated", kwargs))
+        return {"match_id": MATCH_ID}
 
     def ladder(self, *, limit: int) -> dict[str, Any]:
         self.calls.append(("ladder", limit))
@@ -90,6 +110,14 @@ def test_all_allowlisted_operations_round_trip_and_replay_stays_binary(
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
         client = UnixPlatformClient(path)
         assert client.session()["team"]["name"] == "Alpha"
+        assert client.scrim_profile()["active_submission"]["version"] == 7
+        assert client.team_search(" beta ", limit=10)["teams"][0]["name"] == "Beta"
+        assert client.platform_maps()["maps"] == ["atoll", "crossfire"]
+        assert client.request_unrated(
+            OPPONENT_ID,
+            source_match_id=MATCH_ID,
+            map_names=["atoll"],
+        ) == {"match_id": MATCH_ID}
         assert client.ladder(limit=50)["total"] == 1
         assert client.test_runs(limit=25)["test_runs"] == [{"id": "test-run-1"}]
         assert client.matches(
@@ -105,6 +133,17 @@ def test_all_allowlisted_operations_round_trip_and_replay_stays_binary(
     assert not path.exists()
     assert platform.calls == [
         ("session", None),
+        ("scrim_profile", None),
+        ("team_search", {"query": "beta", "limit": 10}),
+        ("platform_maps", None),
+        (
+            "request_unrated",
+            {
+                "opponent_team_id": OPPONENT_ID,
+                "source_match_id": MATCH_ID,
+                "map_names": ["atoll"],
+            },
+        ),
         ("ladder", 50),
         ("test_runs", 25),
         (
@@ -136,6 +175,30 @@ def test_platform_errors_cross_with_only_their_safe_status_and_message(
             client.ladder(limit=10)
     assert raised.value.code == 429
     assert raised.value.message == "FCode platform rate limit reached"
+
+
+def test_scrim_retry_and_unknown_outcome_metadata_crosses_sidecar(
+    tmp_path: Path,
+) -> None:
+    class Uncertain(PlatformStub):
+        def request_unrated(self, **kwargs: Any) -> dict[str, Any]:
+            del kwargs
+            raise PlatformError(
+                429,
+                "Rate limit exceeded",
+                retry_after_s=83,
+                outcome_unknown=True,
+            )
+
+    with running_sidecar(tmp_path / "platform.sock", Uncertain()) as server:
+        client = UnixPlatformClient(server.server_address)
+        with pytest.raises(PlatformError) as raised:
+            client.request_unrated(OPPONENT_ID)
+
+    assert raised.value.code == 429
+    assert raised.value.message == "Rate limit exceeded"
+    assert raised.value.retry_after_s == 83
+    assert raised.value.outcome_unknown is True
 
 
 def test_unexpected_backend_errors_are_not_disclosed(
@@ -173,8 +236,24 @@ def test_malformed_backend_results_are_reported_as_upstream_failures(
     [
         (lambda client: client.ladder(limit=0), "limit"),
         (lambda client: client.test_runs(limit=101), "limit"),
+        (lambda client: client.team_search("bad\nquery"), "query"),
+        (lambda client: client.team_search("team", limit=21), "limit"),
         (lambda client: client.match(MATCH_ID.upper()), "canonical UUID"),
         (lambda client: client.replay(MATCH_ID, 6), "game"),
+        (
+            lambda client: client.request_unrated(OPPONENT_ID, map_names=["map"] * 6),
+            "at most 5",
+        ),
+        (
+            lambda client: client.request_unrated(
+                OPPONENT_ID, map_names=["bad\nmap"]
+            ),
+            "map name",
+        ),
+        (
+            lambda client: client.request_unrated("not-a-team"),
+            "canonical UUID",
+        ),
         (
             lambda client: client.matches(
                 limit=20, mine=True, team_id=TEAM_ID
@@ -224,6 +303,18 @@ def _raw_call(path: str, header: dict[str, Any], body: bytes = b"") -> dict[str,
     [
         {"op": "delete_team", "args": {}},
         {"op": "session", "args": {"extra": True}},
+        {"op": "scrim_profile", "args": {"extra": True}},
+        {"op": "platform_maps", "args": {"extra": True}},
+        {"op": "team_search", "args": {"query": "team"}},
+        {"op": "team_search", "args": {"query": "team", "limit": 21}},
+        {
+            "op": "request_unrated",
+            "args": {
+                "opponent_team_id": OPPONENT_ID,
+                "source_match_id": None,
+                "map_names": ["map"] * 6,
+            },
+        },
         {"op": "test_runs", "args": {}},
         {"op": "test_runs", "args": {"limit": True}},
         {"op": "test_runs", "args": {"limit": 101}},

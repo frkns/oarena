@@ -112,11 +112,19 @@ def test_square_bundle_pins_constants_to_each_replay(bundle: str) -> None:
     assert "il(o, e.gameConstants)" in bundle
 
 
-def test_square_bundle_keeps_one_current_replay_timeline(bundle: str) -> None:
-    assert "preparedReplays" not in bundle
-    assert "prepareReplay" not in bundle
+def test_square_bundle_keeps_a_bounded_prepared_replay_cache(bundle: str) -> None:
+    assert "const OARENA_PREPARED_REPLAY_LIMIT = 4" in bundle
+    assert "const OARENA_PREPARED_REPLAY_BYTE_BUDGET = 64 * 1024 * 1024" in bundle
+    assert "preparedReplays = m.useRef(new Map())" in bundle
+    assert "preparedReplayBytes = m.useRef(0)" in bundle
+    assert "takePreparedReplay(replayKey)" in bundle
+    assert "handleBridgeHasPrepared = m.useCallback" in bundle
+    assert "preparedReplays.current.has(key)" in bundle
+    assert "storePreparedReplay(" in bundle
     assert 'new Error("Replay bytes are required")' in bundle
-    assert "const Ee = fl(_, !0)" in bundle
+    assert "Ee = fl(_, !0, options.metadata)" in bundle
+    assert "const decoded = fl(_, !1, metadata)" in bundle
+    assert "if (warmTimeSeries) decoded.computeTimeSeries(Ko)" in bundle
     assert "ut.dispose()" in bundle
     assert "fr.loadReplay(Ee)" in bundle
 
@@ -251,7 +259,8 @@ def test_square_bundle_prunes_non_cambridge_share_ui(bundle: str) -> None:
 def test_square_bundle_shares_one_time_series_cache_key(bundle: str) -> None:
     assert "computeTimeSeries(da)" not in bundle
     assert "const da =" not in bundle
-    assert bundle.count("computeTimeSeries(Ko)") == 2
+    assert bundle.count("computeTimeSeries(Ko)") >= 2
+    assert "cached.replay.computeTimeSeries(Ko)" in bundle
 
 
 def test_square_bundle_mounts_only_the_active_responsive_sidebar(bundle: str) -> None:

@@ -292,6 +292,160 @@ def test_session_exposes_only_authentication_and_team_identity() -> None:
     assert "tomorrow" not in serialized
 
 
+def test_scrim_profile_normalizes_only_the_active_submission() -> None:
+    upstream = {
+        "submissions": [
+            {
+                "id": "inactive-submission",
+                "version": 6,
+                "status": "ready",
+                "isActive": False,
+            },
+            {
+                "id": "active-submission",
+                "version": 7,
+                "name": "current",
+                "status": "ready",
+                "uploadedAt": "2026-08-05T12:00:00Z",
+                "submittedByName": "private-member",
+                "downloadUrl": "https://signed.example/private",
+                "isActive": True,
+            },
+        ]
+    }
+    opener = QueueOpener(encoded(upstream))
+    client = FcodePlatform(auth_provider=auth(), opener=opener)
+
+    result = client.scrim_profile()
+    assert result == {
+        "team": {"id": TEAM_A, "name": "Alpha"},
+        "active_submission": {
+            "id": "active-submission",
+            "version": 7,
+            "name": "current",
+            "status": "ready",
+            "uploaded_at": "2026-08-05T12:00:00Z",
+        },
+    }
+    request = opener.requests[0][0]
+    assert urllib.parse.urlsplit(request.full_url).path == "/api/submissions"
+    assert request.get_header("Authorization") == "Bearer secret-token"
+    serialized = json.dumps(result)
+    assert "private-member" not in serialized
+    assert "signed.example" not in serialized
+    assert "secret-token" not in serialized
+
+
+def test_scrim_profile_supports_no_active_submission_and_rejects_bad_response() -> None:
+    client = FcodePlatform(
+        auth_provider=auth(),
+        opener=QueueOpener(encoded({"submissions": []})),
+    )
+    assert client.scrim_profile()["active_submission"] is None
+
+    malformed = FcodePlatform(
+        auth_provider=auth(),
+        opener=QueueOpener(encoded({"submissions": {}})),
+    )
+    with pytest.raises(PlatformError, match="invalid submissions response") as caught:
+        malformed.scrim_profile()
+    assert caught.value.code == 502
+
+
+def test_team_search_and_platform_maps_are_normalized_and_bounded() -> None:
+    opener = QueueOpener(
+        encoded(
+            {
+                "teams": [
+                    {
+                        "teamId": TEAM_B,
+                        "teamName": "Beta",
+                        "rating": 1491.5,
+                        "matchesPlayed": 38,
+                        "members": [{"email": "private@example.test"}],
+                    },
+                    {"teamId": TEAM_A, "teamName": "Alpha"},
+                ]
+            }
+        ),
+        encoded(
+            {
+                "maps": [
+                    {"name": "atoll", "s3Key": "private/map"},
+                    {"name": "crossfire", "sha256": "private-hash"},
+                    {"name": 3},
+                ]
+            }
+        ),
+    )
+    client = FcodePlatform(auth_provider=auth(), opener=opener)
+
+    assert client.team_search(" beta ", limit=1) == {
+        "teams": [
+            {
+                "id": TEAM_B,
+                "name": "Beta",
+                "rating": 1491.5,
+                "matches_played": 38,
+            }
+        ]
+    }
+    assert client.platform_maps() == {"maps": ["atoll", "crossfire"]}
+    query = urllib.parse.parse_qs(
+        urllib.parse.urlsplit(opener.requests[0][0].full_url).query
+    )
+    assert query == {"q": ["beta"]}
+    serialized = json.dumps(
+        {"search": client.team_search("beta", limit=1), "maps": client.platform_maps()}
+    )
+    assert "private" not in serialized
+
+
+def test_request_unrated_posts_exact_bounded_payload_and_normalizes_id() -> None:
+    opener = QueueOpener(encoded({"matchId": MATCH_ID}))
+    client = FcodePlatform(auth_provider=auth(), opener=opener)
+
+    assert client.request_unrated(
+        TEAM_B,
+        source_match_id=MATCH_ID,
+        map_names=[" atoll ", "crossfire"],
+    ) == {"match_id": MATCH_ID}
+    request = opener.requests[0][0]
+    assert request.method == "POST"
+    assert urllib.parse.urlsplit(request.full_url).path == "/api/matches/unrated"
+    assert request.get_header("Authorization") == "Bearer secret-token"
+    assert request.get_header("Content-type") == "application/json"
+    assert json.loads(request.data) == {
+        "opponentTeamId": TEAM_B,
+        "sourceMatchId": MATCH_ID,
+        "mapNames": ["atoll", "crossfire"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        (
+            {"opponent_team_id": "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"},
+            "canonical UUID",
+        ),
+        ({"opponent_team_id": TEAM_B, "source_match_id": "bad"}, "canonical UUID"),
+        ({"opponent_team_id": TEAM_B, "map_names": "atoll"}, "must be a list"),
+        ({"opponent_team_id": TEAM_B, "map_names": ["map"] * 6}, "at most 5"),
+        ({"opponent_team_id": TEAM_B, "map_names": ["bad\nmap"]}, "map name"),
+    ],
+)
+def test_request_unrated_rejects_invalid_inputs_before_network(
+    kwargs: dict[str, Any], message: str
+) -> None:
+    opener = QueueOpener()
+    client = FcodePlatform(auth_provider=auth(), opener=opener)
+    with pytest.raises(PlatformError, match=message) as caught:
+        client.request_unrated(**kwargs)
+    assert caught.value.code == 400
+    assert opener.requests == []
+
+
 def test_match_list_is_normalized_filtered_and_short_cached() -> None:
     match_error = "validation failed: " + ("x" * 1200) + " PRIVATE-ERROR-TAIL"
     raw_match = upstream_match()
@@ -778,6 +932,200 @@ def test_remote_http_errors_are_typed_and_do_not_echo_body(
         client.matches(limit=1)
     assert caught.value.code == expected
     assert "private-upstream-detail" not in caught.value.message
+
+
+def test_unrated_live_400_rate_limit_is_reclassified_and_retry_is_preserved() -> None:
+    headers = Message()
+    headers["Retry-After"] = "37"
+    body = io.BytesIO(
+        json.dumps(
+            {
+                "error": (
+                    "Rate limit exceeded: max 5 test/unrated matches "
+                    "per 10 minutes"
+                )
+            }
+        ).encode()
+    )
+    error = urllib.error.HTTPError(
+        "https://api.example.test/api/matches/unrated",
+        400,
+        "upstream",
+        headers,
+        body,
+    )
+    client = FcodePlatform(auth_provider=auth(), opener=QueueOpener(error))
+
+    with pytest.raises(PlatformError) as caught:
+        client.request_unrated(TEAM_B)
+
+    assert caught.value.code == 429
+    assert caught.value.retry_after_s == 37
+    assert caught.value.outcome_unknown is False
+    assert caught.value.message == (
+        "Rate limit exceeded: max 5 test/unrated matches per 10 minutes"
+    )
+
+
+def test_retry_after_http_date_is_parsed_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = platformmod.parsedate_to_datetime(
+        "Wed, 05 Aug 2026 12:00:00 GMT"
+    ).timestamp()
+    monkeypatch.setattr(platformmod.time, "time", lambda: now)
+    headers = Message()
+    headers["Retry-After"] = "Wed, 05 Aug 2026 12:01:00 GMT"
+    assert platformmod._retry_after_seconds(headers) == 60
+
+    headers.replace_header("Retry-After", str(platformmod._MAX_RETRY_AFTER_S + 1))
+    assert platformmod._retry_after_seconds(headers) == platformmod._MAX_RETRY_AFTER_S
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_message"),
+    [
+        (400, "FCode rejected unrated match request"),
+        (401, "FCode session expired; run `fcode login`"),
+        (403, "FCode rejected unrated match request"),
+        (404, "FCode resource not found"),
+        (409, "FCode rejected unrated match request"),
+        (422, "FCode rejected unrated match request"),
+        (429, "FCode platform rate limit reached"),
+    ],
+)
+def test_unrated_4xx_errors_never_expose_arbitrary_upstream_text(
+    status: int, expected_message: str
+) -> None:
+    private_detail = "private\nvalidation\tdetail " + ("x" * 1000)
+    headers = Message()
+    headers["Retry-After"] = "19"
+    error = urllib.error.HTTPError(
+        "https://api.example.test/api/matches/unrated",
+        status,
+        "upstream",
+        headers,
+        io.BytesIO(json.dumps({"error": private_detail}).encode()),
+    )
+    client = FcodePlatform(auth_provider=auth(), opener=QueueOpener(error))
+
+    with pytest.raises(PlatformError) as caught:
+        client.request_unrated(TEAM_B)
+
+    assert caught.value.code == status
+    assert caught.value.message == expected_message
+    assert "private" not in caught.value.message
+    assert len(caught.value.message) < 100
+    assert caught.value.retry_after_s == 19
+    assert caught.value.outcome_unknown is False
+
+
+def test_unrated_rate_limit_is_recognized_without_echoing_upstream_text() -> None:
+    body = {
+        "error": (
+            "Rate limit exceeded: max 5 test/unrated matches per 10 minutes "
+            "private-detail"
+        )
+    }
+    error = urllib.error.HTTPError(
+        "https://api.example.test/api/matches/unrated",
+        400,
+        "upstream",
+        Message(),
+        io.BytesIO(json.dumps(body).encode()),
+    )
+    client = FcodePlatform(auth_provider=auth(), opener=QueueOpener(error))
+
+    with pytest.raises(PlatformError) as caught:
+        client.request_unrated(TEAM_B)
+
+    # A quota message is a cooldown, not a rejection, even when upstream pads it.
+    assert caught.value.code == 429
+    # The reply is rebuilt from the parsed numbers, so padding cannot leak.
+    assert caught.value.message == (
+        "Rate limit exceeded: max 5 test/unrated matches per 10 minutes"
+    )
+    assert "private-detail" not in caught.value.message
+    assert caught.value.retry_after_s == 600
+
+
+def test_unrated_rate_limit_tracks_a_retuned_upstream_quota() -> None:
+    body = {"error": "Rate limit exceeded: max 3 unrated matches per 5 minutes"}
+    error = urllib.error.HTTPError(
+        "https://api.example.test/api/matches/unrated",
+        400,
+        "upstream",
+        Message(),
+        io.BytesIO(json.dumps(body).encode()),
+    )
+    client = FcodePlatform(auth_provider=auth(), opener=QueueOpener(error))
+
+    with pytest.raises(PlatformError) as caught:
+        client.request_unrated(TEAM_B)
+
+    assert caught.value.code == 429
+    assert "max 3" in caught.value.message
+    assert caught.value.retry_after_s == 300
+    assert caught.value.outcome_unknown is False
+
+
+def test_unrecognized_unrated_rejection_stays_a_plain_rejection() -> None:
+    body = {"error": "Opponent has no active submission"}
+    error = urllib.error.HTTPError(
+        "https://api.example.test/api/matches/unrated",
+        400,
+        "upstream",
+        Message(),
+        io.BytesIO(json.dumps(body).encode()),
+    )
+    client = FcodePlatform(auth_provider=auth(), opener=QueueOpener(error))
+
+    with pytest.raises(PlatformError) as caught:
+        client.request_unrated(TEAM_B)
+
+    assert caught.value.code == 400
+    assert caught.value.message == "FCode rejected unrated match request"
+
+
+@pytest.mark.parametrize(
+    ("failure", "code"),
+    [
+        (socket.timeout("private timeout"), 504),
+        (urllib.error.URLError("private network failure"), 502),
+        (
+            urllib.error.HTTPError(
+                "https://api.example.test/api/matches/unrated",
+                500,
+                "upstream",
+                Message(),
+                io.BytesIO(b'{"error":"private server detail"}'),
+            ),
+            502,
+        ),
+    ],
+)
+def test_unrated_transport_and_server_failures_have_unknown_outcome(
+    failure: BaseException, code: int
+) -> None:
+    client = FcodePlatform(auth_provider=auth(), opener=QueueOpener(failure))
+
+    with pytest.raises(PlatformError) as caught:
+        client.request_unrated(TEAM_B)
+
+    assert caught.value.code == code
+    assert caught.value.outcome_unknown is True
+    assert "private" not in caught.value.message
+
+
+@pytest.mark.parametrize("response", [encoded([]), encoded({}), encoded({"matchId": "bad"})])
+def test_unrated_malformed_success_has_unknown_outcome(response: Response) -> None:
+    client = FcodePlatform(auth_provider=auth(), opener=QueueOpener(response))
+
+    with pytest.raises(PlatformError, match="invalid unrated match response") as caught:
+        client.request_unrated(TEAM_B)
+
+    assert caught.value.code == 502
+    assert caught.value.outcome_unknown is True
 
 
 def test_timeout_is_reported_as_gateway_timeout() -> None:

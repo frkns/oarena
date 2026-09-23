@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import os
 from pathlib import Path
 
 import pytest
@@ -150,6 +151,20 @@ def test_official_map_wins_an_extra_name_collision(tmp_path: Path) -> None:
     ]
 
 
+def test_discover_recurses_into_provenance_directories(tmp_path: Path) -> None:
+    official = tmp_path / "maps"
+    extra = tmp_path / "more_maps" / "vae" / "batch"
+    if not copy_maps(official, ("sprint",)) or not copy_maps(extra, ("duel",)):
+        pytest.skip("no stock .map26 files available")
+
+    found = maps.discover(official, tmp_path / "more_maps")
+
+    assert {game_map.name: game_map.source for game_map in found} == {
+        "sprint": "official",
+        "duel": "extra",
+    }
+
+
 # --------------------------------------------------------------------------- #
 # resolve
 # --------------------------------------------------------------------------- #
@@ -202,6 +217,17 @@ def test_resolve_finds_an_extra_map(maps_dir: Path, tmp_path: Path) -> None:
     assert game_map.source == "extra"
 
 
+def test_resolve_finds_a_nested_extra_map(maps_dir: Path, tmp_path: Path) -> None:
+    extra = tmp_path / "more_maps" / "vae" / "batch"
+    if not copy_maps(extra, ("pinch",)):
+        pytest.skip("no stock .map26 files available")
+
+    game_map = maps.resolve(maps_dir, "pinch", tmp_path / "more_maps")
+
+    assert game_map.path == extra / "pinch.map26"
+    assert game_map.source == "extra"
+
+
 # --------------------------------------------------------------------------- #
 # select
 # --------------------------------------------------------------------------- #
@@ -248,3 +274,56 @@ def test_select_raises_when_nothing_is_available(tmp_path: Path) -> None:
 def test_select_propagates_an_unknown_name(maps_dir: Path) -> None:
     with pytest.raises(MapError):
         maps.select(maps_dir, ["atlantis"], [])
+
+
+def test_map_json_is_cached_against_the_file_and_reflects_an_edit(
+    tmp_path: Path,
+) -> None:
+    """The dashboard asks for every map on every state read.
+
+    Both halves of `to_json` -- base64 of the tiles and the board flood-fill in
+    `analysis` -- depend only on the file, so recomputing 239 of them per
+    request cost 0.2s producing answers that had not changed.
+    """
+    if not copy_maps(tmp_path, ("sprint",)):
+        pytest.skip("no stock .map26 files available")
+    maps._JSON_CACHE.clear()
+    payload = maps.discover(tmp_path)[0].to_json()
+
+    # A freshly discovered object for an unchanged file reuses the same payload.
+    assert maps.discover(tmp_path)[0].to_json() is payload
+
+    # Replacing the file invalidates it, with no explicit cache clearing.
+    replaced = tmp_path / "sprint.map26"
+    replaced.unlink()
+    if not copy_maps(tmp_path, ("duel",)):
+        pytest.skip("no stock .map26 files available")
+    (tmp_path / "duel.map26").rename(replaced)
+    edited = maps.discover(tmp_path)[0].to_json()
+
+    assert edited is not payload
+    assert (edited["width"], edited["height"]) != (payload["width"], payload["height"])
+
+
+def test_map_json_cache_is_bounded_and_survives_a_missing_file(
+    tmp_path: Path,
+) -> None:
+    if not copy_maps(tmp_path, ("sprint", "duel")):
+        pytest.skip("no stock .map26 files available")
+    maps._JSON_CACHE.clear()
+    try:
+        discovered = maps.discover(tmp_path)
+        for game_map in discovered:
+            game_map.to_json()
+        assert len(maps._JSON_CACHE) == len(discovered)
+        assert maps._JSON_CACHE_MAX > 0
+
+        # A map whose file has gone is still serialisable, just uncached.
+        vanished = discovered[0]
+        for stale in tmp_path.glob("*.map26"):
+            stale.unlink()
+        maps._JSON_CACHE.clear()
+        assert vanished.to_json()["name"] == vanished.name
+        assert maps._JSON_CACHE == {}
+    finally:
+        maps._JSON_CACHE.clear()

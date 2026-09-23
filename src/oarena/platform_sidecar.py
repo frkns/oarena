@@ -1,8 +1,8 @@
-"""Serve the read-only FCode platform boundary over a filesystem Unix socket.
+"""Serve the bounded FCode platform boundary over a filesystem Unix socket.
 
 Run this process outside oarena's game-worker network/home sandbox, then set
 ``OARENA_PLATFORM_SOCKET`` for ``oarena serve``.  The RPC surface is deliberately
-limited to the six read operations needed by the dashboard's FCode tab.
+limited to the explicit dashboard operations, including one unrated-match write.
 """
 
 from __future__ import annotations
@@ -46,20 +46,39 @@ _MAX_WORKERS = 32
 _DEFAULT_CONNECTION_TIMEOUT_S = 20.0
 
 
-def _safe_platform_error(exc: PlatformError) -> tuple[int, str]:
+def _safe_platform_error(exc: PlatformError) -> dict[str, Any]:
     code = exc.code
     if isinstance(code, bool) or not isinstance(code, int) or not 400 <= code <= 599:
-        return 502, "FCode platform request failed"
+        return {"code": 502, "message": "FCode platform request failed"}
     try:
-        return code, _safe_error_message(exc.message)
+        message = _safe_error_message(exc.message)
     except _ProtocolError:
-        return 502, "FCode platform request failed"
+        return {"code": 502, "message": "FCode platform request failed"}
+    result: dict[str, Any] = {"code": code, "message": message}
+    retry_after_s = exc.retry_after_s
+    if (
+        not isinstance(retry_after_s, bool)
+        and isinstance(retry_after_s, int)
+        and 0 <= retry_after_s <= 7 * 24 * 60 * 60
+    ):
+        result["retry_after_s"] = retry_after_s
+    if exc.outcome_unknown is True:
+        result["outcome_unknown"] = True
+    return result
 
 
 def _dispatch(platform: Any, op: str, args: dict[str, Any]) -> dict[str, Any] | bytes:
     """Explicit dispatch keeps the socket from becoming a generic method bridge."""
     if op == "session":
         return platform.session()
+    if op == "scrim_profile":
+        return platform.scrim_profile()
+    if op == "team_search":
+        return platform.team_search(**args)
+    if op == "platform_maps":
+        return platform.platform_maps()
+    if op == "request_unrated":
+        return platform.request_unrated(**args)
     if op == "ladder":
         return platform.ladder(limit=args["limit"])
     if op == "test_runs":
@@ -82,6 +101,7 @@ class _PlatformRpcHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         peer = self.request
         peer.settimeout(self.server.connection_timeout_s)
+        op: str | None = None
         try:
             request_deadline = time.monotonic() + self.server.connection_timeout_s
             header, body = _recv_frame(
@@ -121,35 +141,77 @@ class _PlatformRpcHandler(socketserver.BaseRequestHandler):
                 return
             result = _dispatch(self.server.platform, op, args)
             if not isinstance(result, dict):
-                raise PlatformError(502, "FCode platform request failed")
+                raise PlatformError(
+                    502,
+                    "FCode platform request failed",
+                    outcome_unknown=op == "request_unrated",
+                )
             try:
                 encoded = _json_bytes(result)
             except _ProtocolError as exc:
-                raise PlatformError(502, "FCode platform request failed") from exc
+                raise PlatformError(
+                    502,
+                    "FCode platform request failed",
+                    outcome_unknown=op == "request_unrated",
+                ) from exc
             if len(encoded) > _MAX_JSON_BODY_BYTES:
-                raise PlatformError(502, "FCode platform response is too large")
+                raise PlatformError(
+                    502,
+                    "FCode platform response is too large",
+                    outcome_unknown=op == "request_unrated",
+                )
             _send_frame(peer, {"ok": True, "kind": "json"}, encoded)
         except PlatformError as exc:
-            code, message = _safe_platform_error(exc)
-            self._error(peer, code, message)
+            error = _safe_platform_error(exc)
+            self._error(peer, **error)
         except (TimeoutError, socket.timeout):
-            self._error(peer, 408, "platform RPC request timed out")
+            self._error(
+                peer,
+                408,
+                "platform RPC request timed out",
+                outcome_unknown=op == "request_unrated",
+            )
         except _ProtocolError:
-            self._error(peer, 400, "invalid platform RPC request")
+            self._error(
+                peer,
+                400,
+                "invalid platform RPC request",
+                outcome_unknown=op == "request_unrated",
+            )
         except (BrokenPipeError, ConnectionResetError):
             return
         except Exception:
             # Exception text may contain a bearer, signed URL, or credential
             # path. Keep journald as sanitized as the browser response.
             _LOG.error("unexpected platform sidecar request failure")
-            self._error(peer, 502, "FCode platform request failed")
+            self._error(
+                peer,
+                502,
+                "FCode platform request failed",
+                outcome_unknown=op == "request_unrated",
+            )
 
     @staticmethod
-    def _error(peer: socket.socket, code: int, message: str) -> None:
+    def _error(
+        peer: socket.socket,
+        code: int,
+        message: str,
+        retry_after_s: int | None = None,
+        outcome_unknown: bool = False,
+    ) -> None:
         try:
+            header: dict[str, Any] = {
+                "ok": False,
+                "code": code,
+                "message": message,
+            }
+            if retry_after_s is not None:
+                header["retry_after_s"] = retry_after_s
+            if outcome_unknown:
+                header["outcome_unknown"] = True
             _send_frame(
                 peer,
-                {"ok": False, "code": code, "message": message},
+                header,
                 b"",
             )
         except (OSError, _ProtocolError):
@@ -364,7 +426,7 @@ def _positive_workers(value: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="serve oarena's read-only FCode platform client over AF_UNIX"
+        description="serve oarena's bounded FCode platform client over AF_UNIX"
     )
     parser.add_argument("--socket", required=True, help="absolute filesystem socket path")
     parser.add_argument(

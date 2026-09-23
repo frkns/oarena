@@ -42,7 +42,19 @@ const APPLIED_CAP = 4000;
 export const CI = 1.959963984540054;
 export const CI_LABEL = "\u03bc \u2212 1.96\u03c3";
 
+function loadedWebRevision() {
+  if (typeof document === "undefined") return "";
+  const value = document.querySelector('meta[name="oarena-web-revision"]')?.content;
+  return typeof value === "string" ? value : "";
+}
+
 export const state = {
+  /** Opaque identity of the Python server process that supplied this snapshot. */
+  instance: "",
+  /** Immutable fingerprint of the HTML/CSS/JS loaded by this document. */
+  webRevision: loadedWebRevision(),
+  /** Fingerprint reported by the latest `/api/state` snapshot. */
+  serverWebRevision: "",
   /** `/api/state.config` — project name, root, workers, defaults. */
   config: null,
   /** The `League.status` dict: running, mode, done/total, rate, live matchups. */
@@ -182,6 +194,11 @@ export async function api(path, { method = "GET", body = null } = {}) {
  */
 export async function refresh() {
   const data = await api("/api/state");
+  state.instance = typeof data.instance === "string" ? data.instance : "";
+  state.serverWebRevision = typeof data.web_revision === "string" ? data.web_revision : "";
+  // Legacy/custom HTML may not carry the revision stamp. Pin the first server
+  // value rather than adopting later revisions without loading their modules.
+  if (!state.webRevision) state.webRevision = state.serverWebRevision;
   state.config = data.config ?? null;
   state.status = data.status ?? null;
   state.ladder = Array.isArray(data.ladder) ? data.ladder : [];
@@ -194,6 +211,33 @@ export async function refresh() {
   emit("state", state);
   emit("status", state.status);
   return state;
+}
+
+/**
+ * Classify identities in an SSE hello independently of its recyclable seq.
+ *
+ * Event counters start over for every Python child, so equal numeric counters
+ * cannot prove that a reconnect reached the same process. Browser-code changes
+ * take precedence because refreshing JSON cannot update an already-loaded
+ * module graph.
+ */
+export function serverHelloChanges(current, hello) {
+  const knownInstance = typeof current?.instance === "string" ? current.instance : "";
+  const nextInstance = typeof hello?.instance === "string" ? hello.instance : "";
+  const knownWebRevision = typeof current?.webRevision === "string"
+    ? current.webRevision
+    : "";
+  const nextWebRevision = typeof hello?.web_revision === "string"
+    ? hello.web_revision
+    : "";
+  return {
+    webChanged: Boolean(
+      knownWebRevision && nextWebRevision && knownWebRevision !== nextWebRevision
+    ),
+    instanceChanged: Boolean(
+      knownInstance && nextInstance && knownInstance !== nextInstance
+    ),
+  };
 }
 
 // --------------------------------------------------------------------------

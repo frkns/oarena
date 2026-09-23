@@ -271,6 +271,8 @@ def game_summary_json(g: Game) -> dict[str, Any]:
         "duration_ms": g.duration_ms,
         "resign_message": g.resign_message,
         "error": g.error,
+        "a_errors": g.a_errors,
+        "b_errors": g.b_errors,
         "has_replay": bool(g.replay),
         "tag": g.tag,
         "batch_ordinal": g.batch_ordinal,

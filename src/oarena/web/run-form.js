@@ -1,8 +1,14 @@
 /** Persist and reconcile the Run-games form without depending on the DOM. */
 
 export const RUN_DIALOG_STORAGE_PREFIX = "oarena.run.dialog.v1:";
+export const MIN_CUSTOM_SEED = "0";
+export const MAX_CUSTOM_SEED = "9223372036854775807";
+
+const MIN_CUSTOM_SEED_BIGINT = BigInt(MIN_CUSTOM_SEED);
+const MAX_CUSTOM_SEED_BIGINT = BigInt(MAX_CUSTOM_SEED);
 
 const ARENA_KINDS = new Set(["ladder", "top", "vs", "rr"]);
+const SEED_POLICIES = new Set(["random", "fixed"]);
 const MAX_BATCH_TAG_LENGTH = 200;
 const MAX_TRACKED_WEB_MATCHES = 8;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -80,6 +86,70 @@ function safeGameId(value) {
 
 function safeBatchOrdinal(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/** True only for a planned game belonging to the newest finite Match batch. */
+export function isLatestMatchGame(game, latestMatchTag) {
+  const tag = safeBatchTag(latestMatchTag);
+  return Boolean(
+    tag !== null &&
+    game &&
+    typeof game === "object" &&
+    !Array.isArray(game) &&
+    game.tag === tag &&
+    safeBatchOrdinal(game.batch_ordinal) !== null
+  );
+}
+
+function safeCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/**
+ * Build the short-lived status shown after a run POST wins the race against SSE.
+ *
+ * Never inherit the previous run's counters: doing so can make a newly queued
+ * Match look complete and "0 in flight" until the first live status arrives.
+ */
+export function optimisticRunStatus(previous, run) {
+  const prior = previous && typeof previous === "object" && !Array.isArray(previous)
+    ? previous
+    : {};
+  const meta = run && typeof run === "object" && !Array.isArray(run) ? run : {};
+  const total = safeCount(meta.total);
+  const batchTag = safeBatchTag(meta.batchTag);
+  return {
+    ...prior,
+    running: true,
+    stopping: false,
+    mode: typeof meta.mode === "string" && meta.mode ? meta.mode : "running",
+    label: typeof meta.label === "string" ? meta.label : "",
+    queued: total ?? 0,
+    in_flight: 0,
+    done: 0,
+    total,
+    rate: 0,
+    idle_reason: "",
+    live: [],
+    // This client-only marker lets exact-batch fallback settle only the status
+    // it created. A real server status replaces the object and drops it.
+    web_match_tag: batchTag,
+  };
+}
+
+/** A truthful activity label for the topbar while a run is active. */
+export function runActivityLabel(status) {
+  if (!status || typeof status !== "object" || !status.running) return "";
+  const inFlight = safeCount(status.in_flight);
+  if (inFlight !== null && inFlight > 0) return `${inFlight} in flight`;
+  const queued = safeCount(status.queued);
+  if (queued !== null && queued > 0) return `${queued} queued`;
+  if (typeof status.idle_reason === "string" && status.idle_reason) return "";
+  const done = safeCount(status.done);
+  const total = safeCount(status.total);
+  return total !== null && total > 0 && done !== null && done >= total
+    ? "finishing"
+    : "starting";
 }
 
 /**
@@ -222,7 +292,11 @@ function sourceRecency(row) {
  * most recently changed bot source.  The input array is copied because it is
  * the live ladder and must remain rating ordered.
  */
-export function botSuggestions(rows, query = "", { everyone = false, limit = 10 } = {}) {
+export function botSuggestions(
+  rows,
+  query = "",
+  { everyone = false, includeInactive = false, limit = 10 } = {},
+) {
   const cap = Math.min(10, Math.max(0, Math.trunc(Number(limit) || 0)));
   if (cap === 0) return [];
 
@@ -230,7 +304,8 @@ export function botSuggestions(rows, query = "", { everyone = false, limit = 10 
   for (const row of Array.isArray(rows) ? rows : []) {
     if (
       !row ||
-      row.active === false ||
+      row.source_present === false ||
+      (!includeInactive && row.active === false) ||
       typeof row.name !== "string" ||
       !row.name ||
       unique.has(row.name)
@@ -289,6 +364,32 @@ function intOr(value, min, max, fallback) {
   return Number.isInteger(value) ? Math.min(max, Math.max(min, value)) : fallback;
 }
 
+/** Canonical decimal seed, preserving values wider than JavaScript's safe integers. */
+export function normalizeCustomSeed(value) {
+  let text;
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) return null;
+    text = String(value);
+  } else if (typeof value === "string") {
+    text = value.trim();
+  } else {
+    return null;
+  }
+  if (!/^\d+$/.test(text)) return null;
+  text = text.replace(/^0+(?=\d)/, "");
+  if (text.length > MAX_CUSTOM_SEED.length) return null;
+  const number = BigInt(text);
+  return number >= MIN_CUSTOM_SEED_BIGINT && number <= MAX_CUSTOM_SEED_BIGINT
+    ? number.toString()
+    : null;
+}
+
+export function customSeedFitsRounds(value, rounds) {
+  const seed = normalizeCustomSeed(value);
+  if (seed === null || !Number.isInteger(rounds) || rounds < 1) return false;
+  return BigInt(seed) + BigInt(rounds - 1) <= MAX_CUSTOM_SEED_BIGINT;
+}
+
 function uniqueKnown(values, known) {
   if (!Array.isArray(values)) return [];
   return [...new Set(values.filter((value) => typeof value === "string" && known.has(value)))];
@@ -325,10 +426,15 @@ export function saveRunDialogDraft(storage, project, draft) {
  * Merge a stored draft with current project defaults and catalogs.
  *
  * Bot and map directories can be renamed or deleted between visits. Stale
- * names fall back safely; an explicitly saved empty map list remains empty.
+ * names fall back safely; Match may use a wider bot catalog than Arena, and
+ * an explicitly saved empty map list remains empty.
  */
-export function normalizeRunDialogDraft(draft, { botNames, mapNames, defaults }) {
+export function normalizeRunDialogDraft(
+  draft,
+  { botNames, arenaBotNames = botNames, mapNames, defaults },
+) {
   const knownBots = new Set(botNames);
+  const knownArenaBots = new Set(arenaBotNames);
   const knownMaps = new Set(mapNames);
   const fallback = record(defaults);
   const fallbackMatch = record(fallback.match);
@@ -341,9 +447,9 @@ export function normalizeRunDialogDraft(draft, { botNames, mapNames, defaults })
   const defaultB = fallbackMatch.b === "*" || knownBots.has(fallbackMatch.b)
     ? fallbackMatch.b
     : (botNames[1] ?? (botNames.length ? "*" : ""));
-  const defaultTarget = knownBots.has(fallbackArena.target)
+  const defaultTarget = knownArenaBots.has(fallbackArena.target)
     ? fallbackArena.target
-    : (botNames[0] ?? "");
+    : (arenaBotNames[0] ?? "");
   const defaultMaps = uniqueKnown(fallbackMatch.maps, knownMaps);
 
   return {
@@ -359,13 +465,19 @@ export function normalizeRunDialogDraft(draft, { botNames, mapNames, defaults })
       repeat: intOr(savedMatch.repeat, 1, 500, intOr(fallbackMatch.repeat, 1, 500, 1)),
       mirror: booleanOr(savedMatch.mirror, booleanOr(fallbackMatch.mirror, true)),
       rated: booleanOr(savedMatch.rated, booleanOr(fallbackMatch.rated, true)),
+      seedPolicy: SEED_POLICIES.has(savedMatch.seedPolicy)
+        ? savedMatch.seedPolicy
+        : SEED_POLICIES.has(fallbackMatch.seedPolicy) ? fallbackMatch.seedPolicy : "random",
+      seed: normalizeCustomSeed(savedMatch.seed)
+        ?? normalizeCustomSeed(fallbackMatch.seed)
+        ?? "1",
     },
     arena: {
       kind: ARENA_KINDS.has(savedArena.kind)
         ? savedArena.kind
         : ARENA_KINDS.has(fallbackArena.kind) ? fallbackArena.kind : "ladder",
       top: intOr(savedArena.top, 2, 64, intOr(fallbackArena.top, 2, 64, 8)),
-      target: knownBots.has(savedArena.target) ? savedArena.target : defaultTarget,
+      target: knownArenaBots.has(savedArena.target) ? savedArena.target : defaultTarget,
       rated: booleanOr(savedArena.rated, booleanOr(fallbackArena.rated, true)),
     },
   };

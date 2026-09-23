@@ -10,6 +10,7 @@ from __future__ import annotations
 import gzip
 import json
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
@@ -20,13 +21,182 @@ from typing import Any, Iterator
 
 import pytest
 
-from conftest import Project
+from conftest import Project, make_project
 from fake_worker import FAKE_FCODE_METADATA, FAKE_FCODE_VERSION
 from oarena import server as servermod
 from oarena.league import Job
 from oarena.runner import GameOutcome
 from oarena.server import App, Server, make_server
-from oarena.store import Game
+from oarena.store import Game, StoreBusyError
+
+
+class _ScrimCoordinatorStub:
+    """No-thread coordinator used by the general HTTP server fixture."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Any]] = []
+        self.closed = False
+        self.validation_error: str | None = None
+
+    def _validate(self) -> None:
+        if self.validation_error is not None:
+            raise ValueError(self.validation_error)
+
+    def snapshot(
+        self, *, limit: int = 100, our_version: str | int | None = None
+    ) -> dict[str, Any]:
+        self._validate()
+        self.calls.append(("snapshot", {"limit": limit, "our_version": our_version}))
+        return {"requests": [], "limit": limit, "our_version": our_version}
+
+    def enqueue_manual(
+        self,
+        request_key: str,
+        opponent_team_id: str,
+        *,
+        opponent_team_name: str | None = None,
+        source_match_id: str | None = None,
+        map_names: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        self._validate()
+        arguments = {
+            "request_key": request_key,
+            "opponent_team_id": opponent_team_id,
+            "opponent_team_name": opponent_team_name,
+            "source_match_id": source_match_id,
+            "map_names": map_names,
+        }
+        self.calls.append(("enqueue_manual", arguments))
+        return {"id": 7, "status": "queued", **arguments}
+
+    def configure_autoscrim(
+        self,
+        enabled: bool,
+        *,
+        target_team_ids: tuple[str, ...] = (),
+        target_team_names: dict[str, str] | None = None,
+        target_matches_per_version: int = 0,
+        map_names: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        self._validate()
+        arguments = {
+            "enabled": enabled,
+            "target_team_ids": target_team_ids,
+            "target_team_names": target_team_names,
+            "target_matches_per_version": target_matches_per_version,
+            "map_names": map_names,
+        }
+        self.calls.append(("configure_autoscrim", arguments))
+        return arguments
+
+    def disable_autoscrim(self) -> dict[str, Any]:
+        self._validate()
+        self.calls.append(("disable_autoscrim", None))
+        return {"enabled": False, "target_team_ids": [_PLATFORM_OTHER_TEAM_ID]}
+
+    def refresh(self) -> None:
+        self._validate()
+        self.calls.append(("refresh", None))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _PlatformHistoryStub:
+    """No-thread official-version tracker used by the HTTP fixture."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Any]] = []
+        self.closed = False
+
+    def observe_matches(self, rows: Any) -> int:
+        observed = list(rows) if isinstance(rows, list) else []
+        self.calls.append(("observe_matches", observed))
+        return len(observed)
+
+    def request_refresh(self, *, platform: Any = None) -> dict[str, Any]:
+        self.calls.append(("request_refresh", platform))
+        return {
+            "started": False,
+            "refreshing": False,
+            "initial_sync_complete": True,
+        }
+
+    def status(self) -> dict[str, Any]:
+        self.calls.append(("status", None))
+        return {
+            "started": False,
+            "refreshing": False,
+            "initial_sync_complete": True,
+        }
+
+    def backfill_state(self) -> list[dict[str, Any]]:
+        self.calls.append(("backfill_state", None))
+        return [
+            {
+                "match_type": "unrated",
+                "covered_from": "2026-08-01T00:00:00Z",
+                "pages_used": 3,
+                "complete": False,
+                "exhausted": False,
+                "target_from": "2026-07-31T00:00:00Z",
+            }
+        ]
+
+    def match_runs(self, *, match_id: str) -> dict[str, Any]:
+        self.calls.append(("match_runs", {"match_id": match_id}))
+        return {
+            "match_id": match_id,
+            "teams": [{"team_id": _PLATFORM_TEAM_ID, "version": 7, "ordinal": 3}],
+        }
+
+    def run_games(
+        self, *, team_id: str, ordinal: int, limit: int = 500
+    ) -> dict[str, Any]:
+        self.calls.append(
+            ("run_games", {"team_id": team_id, "ordinal": ordinal, "limit": limit})
+        )
+        return {
+            "team_id": team_id,
+            "ordinal": ordinal,
+            "version": 7,
+            "total": 1,
+            "truncated": False,
+            "record": {"wins": 1, "losses": 0, "draws": 0, "undecided": 0},
+            "games": [{"match_id": _PLATFORM_MATCH_ID, "result": "win"}],
+        }
+
+    def enrich_ladder(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(("enrich_ladder", payload))
+        result = dict(payload)
+        result["rankings"] = [
+            {**row, "bot_version": 7}
+            for row in payload.get("rankings", [])
+        ]
+        return result
+
+    def history(
+        self, *, team_id: str | None = None, limit: int = 100
+    ) -> dict[str, Any]:
+        self.calls.append(("history", {"team_id": team_id, "limit": limit}))
+        return {
+            "teams": [
+                {
+                    "team_id": team_id or _PLATFORM_TEAM_ID,
+                    "team_name": "Alpha",
+                    "current_version": 7,
+                    "observed_from": "2026-08-01T00:00:00Z",
+                    "observed_through": "2026-08-02T00:00:00Z",
+                    "runs": [],
+                }
+            ],
+            "total": 1,
+            "observed_from": "2026-08-01T00:00:00Z",
+            "observed_through": "2026-08-02T00:00:00Z",
+        }
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class Client:
@@ -69,6 +239,8 @@ class Client:
         conn = HTTPConnection(self.host, self.port, timeout=10)
         payload = None if body is None else json.dumps(body).encode()
         headers = {"Content-Type": "application/json"} if payload else {}
+        if method == "POST":
+            headers["Origin"] = f"http://{self.host}:{self.port}"
         conn.request(method, path, body=payload, headers=headers)
         response = conn.getresponse()
         raw = response.read()
@@ -83,7 +255,13 @@ class Client:
 def app(project: Project) -> App:
     project.league.sync()
     return App(
-        project.cfg, project.store, project.bus, project.league, project.rater
+        project.cfg,
+        project.store,
+        project.bus,
+        project.league,
+        project.rater,
+        scrim_coordinator=_ScrimCoordinatorStub(),  # type: ignore[arg-type]
+        platform_history=_PlatformHistoryStub(),  # type: ignore[arg-type]
     )
 
 
@@ -133,13 +311,29 @@ def seeded(live: tuple[App, Client]) -> tuple[App, Client]:
 # --------------------------------------------------------------------------- #
 
 
-def test_index_is_served(client: Client) -> None:
+def test_index_is_served(client: Client, app: App) -> None:
     status, body, response = client.get("/")
     assert status == 200
     assert response.getheader("Content-Type", "").startswith("text/html")
     assert b"<" in body
     assert b'data-theme="dark"' in body
+    assert b'<meta name="oarena-web-revision" content="' in body
+    assert f'content="{app.web_revision}"'.encode() in body
     assert response.getheader("Cache-Control") == "no-store"
+
+
+def test_theme_is_remembered_in_the_browser_before_css_loads() -> None:
+    web_dir = Path(servermod.__file__).resolve().parent / "web"
+    index = (web_dir / "index.html").read_text(encoding="utf-8")
+    app = (web_dir / "app.js").read_text(encoding="utf-8")
+
+    assert 'localStorage.getItem("oarena-theme")' in index
+    assert index.index('localStorage.getItem("oarena-theme")') < index.index(
+        '<link rel="stylesheet" href="/static/app.css">'
+    )
+    assert 'const THEME_STORAGE_KEY = "oarena-theme"' in app
+    assert "localStorage?.setItem(THEME_STORAGE_KEY, next)" in app
+    assert 'api("/api/theme"' not in app
 
 
 def test_static_files_are_served(client: Client) -> None:
@@ -457,7 +651,12 @@ def test_profiler_telemetry_is_normalised_and_removed_from_visible_log(
     module = tmp_path / "telemetry.mjs"
     shutil.copy2(source, module)
     script = f"""
-const {{ extractProfilerReports, normaliseProfilerRecords }} = await import({json.dumps(module.as_uri())});
+const {{
+  extractProfilerReports,
+  normaliseProfilerRecords,
+  PROFILER_SPAN_MODES,
+  profilerSpanMetric,
+}} = await import({json.dumps(module.as_uri())});
 const modern = '[OARENA:ProfilerReport] ' + JSON.stringify({{
   schema: 2, clock: 'cpu_us', team: 'a', unit_id: 7, unit_type: 'core',
   from_round: 0, to_round: 999, interrupted: 0, bad_nesting: 0,
@@ -475,6 +674,16 @@ if (result.reports[1].spans.move.total_us !== 5000) throw new Error('legacy time
 if (result.text !== ['before', malformed, 'after'].join('\\n')) throw new Error('visible log stripping was not exact');
 const bridged = normaliseProfilerRecords([{{ payload: JSON.parse(legacy.slice('OARENA_TELEMETRY '.length)), legacy: true }}]);
 if (bridged[0].spans.move.self_us !== 4000) throw new Error('bridged legacy time was not repaired');
+if (PROFILER_SPAN_MODES.join(',') !== 'avg,total,max') throw new Error('profiler span modes changed');
+const sample = {{ calls: 4, total_us: 100, self_us: 60, max_total_us: 40 }};
+const avg = profilerSpanMetric(sample);
+if (avg.inclusive_us !== 25 || avg.exclusive_us !== 15) throw new Error('weighted average metric is wrong');
+const total = profilerSpanMetric(sample, 'total');
+if (total.inclusive_us !== 100 || total.exclusive_us !== 60) throw new Error('total metric is wrong');
+const max = profilerSpanMetric(sample, 'max');
+if (max.inclusive_us !== 40 || max.exclusive_us !== null) throw new Error('max metric invented self time');
+const fallback = profilerSpanMetric(sample, 'bogus');
+if (fallback.inclusive_us !== 25 || fallback.exclusive_us !== 15) throw new Error('unknown mode did not default to avg');
 """
     result = subprocess.run(
         [node, "--input-type=module", "--eval", script],
@@ -557,6 +766,16 @@ def test_game_detail_static_layout_contract() -> None:
     assert 'class: "game-log-body"' in source
     assert 'class: "game-profiler-body"' in source
     assert "extractProfilerReports" in source
+    assert 'let profilerSpanMode = "avg"' in source
+    assert '"aria-label": "Profiler span bar metric"' in source
+    assert "PROFILER_SPAN_MODES.map" in source
+    assert "profilerSpanMetric(span, spanMode)" in source
+    assert "metric.exclusive_us === null" in source
+    assert 'class: "badge game-error-mark"' in source
+    assert 'title: [`Game #${Number.isFinite(id) ? id : "?"}`, gameErrorMark]' in source
+    assert "if (gameHasError(data))" in source
+    assert 'gameErrorMark.setAttribute("aria-label", label)' in source
+    assert ".game-error-mark" in css
     assert "requestFullscreen" in source
     assert ".viz-frame:fullscreen" in css
     assert '.viz-frame[data-viewer="official"]' in css
@@ -577,8 +796,8 @@ def test_ladder_distinguishes_last_played_from_source_changed() -> None:
     assert "refs.source.textContent = row.source_updated ? fmt.ago(row.source_updated)" in views
 
 
-def test_persistent_square_viewer_host_and_single_prime_contract() -> None:
-    """One connected viewer primes one likely replay and switches in place."""
+def test_persistent_square_viewer_host_and_batch_prepare_contract() -> None:
+    """One connected viewer primes once and warms later games in place."""
     web_dir = Path(servermod.__file__).resolve().parent / "web"
     index = (web_dir / "index.html").read_text(encoding="utf-8")
     app = (web_dir / "app.js").read_text(encoding="utf-8")
@@ -592,10 +811,15 @@ def test_persistent_square_viewer_host_and_single_prime_contract() -> None:
     assert "replayUrl=" not in index
     assert index.index('id="square-viewer-host"') > index.index('id="drawer-host"')
 
-    assert "SQUARE_REPLAY_CACHE_ENTRIES" not in app
-    assert "SQUARE_PREPARED_ENTRIES" not in app
-    assert "pendingPrepares" not in app
-    assert "prepared = new Map" not in app
+    assert "const SQUARE_PREPARE_LIMIT = 4" in app
+    assert "let prepareGeneration = 0" in app
+    assert "let prepareQueue = []" in app
+    assert "function prepareGames(rows, selectedId)" in app
+    assert "row.batch_ordinal > current.batch_ordinal" in app
+    assert ".slice(0, SQUARE_PREPARE_LIMIT)" in app
+    assert "warmTimeSeries: index === 0" in app
+    assert "? requestIdleCallback(run)" in app
+    assert 'post({ type: "oarena:square:cancel-prepare" })' in app
     assert "primeLikelyReplay" in app
     assert "const page = await preloadGames()" in app
     assert "const PAGE = 30" in views
@@ -614,17 +838,21 @@ def test_persistent_square_viewer_host_and_single_prime_contract() -> None:
         "oarena:square:loading",
         "oarena:square:loaded",
         "oarena:square:error",
+        "oarena:square:prepare",
+        "oarena:square:prepared",
+        "oarena:square:prepare-error",
+        "oarena:square:cancel-prepare",
     ):
         assert message_type in app
     assert "currentLoad?.requestId !== message.requestId" in app
     assert "loadedKey === key && currentLoad === null" in app
     assert '"oarena.square.last-game"' in app
-    assert "oarena:square:prepare" not in app
-    assert "squareViewer.warmRecent" not in app
     assert "squareViewer," in app
 
     assert "squareReplayIntent" not in views
     assert "squareViewer.show(vizSlot, data, theme())" in views
+    assert "squareViewer?.prepareGames(games, id)" in views
+    assert 'if (viewerChoice === "2d")' in views
     assert "squareViewer?.hide(vizSlot)" in views
     assert "squareViewer.requestFullscreen()" in views
     assert 'src: `/viz/?replayUrl=' in views
@@ -646,12 +874,19 @@ def test_map_ui_separates_official_and_extra_catalogs() -> None:
     web_dir = Path(servermod.__file__).resolve().parent / "web"
     index = (web_dir / "index.html").read_text(encoding="utf-8")
     app_source = (web_dir / "app.js").read_text(encoding="utf-8")
+    css = (web_dir / "app.css").read_text(encoding="utf-8")
     views_source = (web_dir / "views.js").read_text(encoding="utf-8")
 
     assert 'id="run-maps-official"' in index
     assert 'id="run-maps-extra"' in index
     assert 'id="run-extra-maps-all"' in index
     assert 'id="run-extra-maps-none"' in index
+    assert 'id="run-seed-policy"' in index
+    assert '<option value="random">Random</option>' in index
+    assert '<option value="fixed">Custom base</option>' in index
+    assert 'id="run-seed" type="number" min="0" max="9223372036854775807"' in index
+    assert 'id="run-seed-help"' in index
+    assert 'id="run-error" role="alert" aria-live="polite"' in index
     for input_id, list_id in (
         ("run-bot-a", "run-bot-a-options"),
         ("run-bot-b", "run-bot-b-options"),
@@ -665,10 +900,25 @@ def test_map_ui_separates_official_and_extra_catalogs() -> None:
     assert 'loadRunDialogDraft(storage, project)' in app_source
     assert 'saveRunDialogDraft(storage, project, {' in app_source
     assert 'maps: selectedMaps()' in app_source
-    assert 'createBotCombobox(botB, botBOptions, { everyone: true })' in app_source
-    assert 'botSuggestions(state.ladder, input.value, { everyone, limit: 10 })' in app_source
+    assert 'seed_policy: seedPolicy.value' in app_source
+    assert 'seed: customSeed' in app_source
+    assert "state.config?.seed_exact ?? state.config?.seed" in app_source
+    assert "let runStartInFlight = false" in app_source
+    assert "dom.modalHost?.contains(node)" in app_source
+    assert 'createBotCombobox(botA, botAOptions, { includeInactive: true })' in app_source
+    assert 'createBotCombobox(botB, botBOptions, { everyone: true, includeInactive: true })' in app_source
+    assert "includeInactive," in app_source
+    assert "return { close, refresh: refreshPicker };" in app_source
+    assert "refreshOpenRunCatalog?.();" in app_source
+    assert "currentActiveNames().includes(arenaTarget.value)" in app_source
+    assert "currentActiveNames().includes(botA.value)" in app_source
     assert 'event.key === "ArrowDown" || event.key === "ArrowUp"' in app_source
     assert 'event.key === "Escape" && !list.hidden' in app_source
+    assert 'import { createMapPreview } from "./map-preview.js";' in app_source
+    assert "const mapPreview = createMapPreview(node);" in app_source
+    assert "mapPreview.bind(chip, map);" in app_source
+    assert ".run-map-preview" in css
+    assert "pointer-events: none" in css
     assert '"Official maps"' in views_source
     assert '"Extra maps"' in views_source
 
@@ -684,11 +934,45 @@ def test_run_submit_cannot_overwrite_a_faster_completed_sse_status() -> None:
 
     capture = "const eventSeqAtSubmit = state.seq;"
     guard = "if (state.seq === eventSeqAtSubmit) {"
-    optimistic_write = "state.status = { ...(state.status || {}), running: true"
+    optimistic_write = "state.status = optimisticRunStatus(state.status, optimisticRun);"
     assert capture in body
     assert guard in body
     assert body.index(capture) < body.index('await api("/api/')
     assert body.index(guard) < body.index(optimistic_write)
+
+
+def test_run_keyboard_shortcut_toggles_and_enter_starts_match() -> None:
+    web_dir = Path(servermod.__file__).resolve().parent / "web"
+    source = (web_dir / "app.js").read_text(encoding="utf-8")
+    index = (web_dir / "index.html").read_text(encoding="utf-8")
+
+    toggle = source[source.index("function toggleRunDialog() {"):source.index(
+        "\nfunction onKeydown(", source.index("function toggleRunDialog() {")
+    )]
+    keyboard = source[source.index("function onKeydown("):source.index(
+        "\n// --------------------------------------------------------------------------\n// boot",
+        source.index("function onKeydown("),
+    )]
+    dialog = source[source.index("export function openRunDialog("):source.index(
+        "\n/** The `?` sheet", source.index("export function openRunDialog(")
+    )]
+
+    assert 'querySelector("#run-dialog")' in toggle
+    assert "closeModal();" in toggle
+    assert 'openRunDialog("match");' in toggle
+    assert 'event.key === "r" && !event.repeat && toggleRunDialog()' in keyboard
+    assert keyboard.index("if (isTyping(event.target)) return;") < keyboard.index(
+        'event.key === "r"'
+    ) < keyboard.index("if (!dom.modalHost.hidden) return;")
+    assert 'case "r":' not in keyboard
+    assert "openModal(node, {" in dialog
+    assert "mapPreview.destroy();" in dialog
+    assert "refreshOpenRunCatalog = null;" in dialog
+    assert "if (!submit.disabled) submit.focus({ preventScroll: true });" in dialog
+    assert "function setTab(next, { persist = true } = {})" in dialog
+    assert "setTab(tab, { persist: false });" in dialog
+    assert "Toggle the Match Run dialog" in index
+    assert "Start the configured Match" in index
 
 
 def test_dashboard_live_ladder_ignores_unrated_records_but_matrix_keeps_them(
@@ -1058,13 +1342,61 @@ def test_square_viz_redirects_the_bare_prefix(client: Client) -> None:
 def test_api_state_shape(client: Client) -> None:
     state = client.json("/api/state")
 
-    assert set(state) >= {"config", "status", "ladder", "maps", "counts", "fcode", "seq"}
+    assert set(state) >= {
+        "config", "status", "ladder", "maps", "counts", "fcode", "seq",
+        "instance", "web_revision",
+    }
     assert state["config"]["name"] == "proj"
     assert state["counts"]["bots"] == 3
     assert state["counts"]["maps"] == 3
     assert state["counts"]["games"] == 0
     assert isinstance(state["seq"], int)
+    assert isinstance(state["instance"], str) and state["instance"]
+    assert isinstance(state["web_revision"], str) and state["web_revision"]
     assert [row["name"] for row in state["ladder"]] == ["alpha", "beta", "gamma"]
+
+
+def test_web_revision_tracks_browser_code_but_not_unrelated_assets(tmp_path: Path) -> None:
+    web = tmp_path / "web"
+    web.mkdir()
+    (web / "index.html").write_text("<main>one</main>", encoding="utf-8")
+    (web / "app.js").write_text("export const one = 1;", encoding="utf-8")
+    (web / "app.css").write_text("main { color: red; }", encoding="utf-8")
+    (web / "favicon.png").write_bytes(b"one")
+
+    original = servermod._web_revision(web)
+    (web / "favicon.png").write_bytes(b"two")
+    assert servermod._web_revision(web) == original
+
+    (web / "app.js").write_text("export const one = 2;", encoding="utf-8")
+    assert servermod._web_revision(web) != original
+
+
+def test_client_hello_reloads_code_but_only_refreshes_a_new_process() -> None:
+    app_source = (
+        Path(servermod.__file__).resolve().parent / "web" / "app.js"
+    ).read_text(encoding="utf-8")
+    start = app_source.index("function onHello(data) {")
+    end = app_source.index("\nfunction dispatch(", start)
+    hello = app_source[start:end]
+
+    web_change = hello.index("identity.webChanged")
+    reload_page = hello.index("location.reload()")
+    process_change = hello.index("identity.instanceChanged")
+    refresh_state = hello.index('requestFullRefresh("the arena restarted")')
+    legacy_fallback = hello.index("head < state.seq")
+    assert web_change < reload_page < process_change < refresh_state < legacy_fallback
+    assert "state.serverWebRevision" in app_source
+    assert "if (reloadForWebRevisionChange()) return;" in app_source
+
+
+def test_config_json_preserves_a_wide_seed_as_exact_decimal(app: App) -> None:
+    app.cfg = replace(app.cfg, seed=9_223_372_036_854_775_807)
+
+    payload = app.config_json()
+
+    assert payload["seed"] == 9_223_372_036_854_775_807
+    assert payload["seed_exact"] == "9223372036854775807"
 
 
 def test_api_fcode_metadata_matches_installed_pure_python_package(client: Client) -> None:
@@ -1109,7 +1441,7 @@ def test_api_ladder_row_shape(client: Client) -> None:
     rows = client.json("/api/ladder")
     assert len(rows) == 3
     assert set(rows[0]) >= {
-        "rank", "name", "active", "broken", "broken_reason", "score", "lcb95",
+        "rank", "name", "active", "source_present", "broken", "broken_reason", "score", "lcb95",
         "mu", "sigma", "lo", "hi", "games", "wins", "losses", "draws", "winrate",
         "err_games", "err_total", "note", "last_played", "source_updated",
         "source_version_id",
@@ -1117,6 +1449,17 @@ def test_api_ladder_row_shape(client: Client) -> None:
     assert rows[0]["lcb95"] == pytest.approx(rows[0]["score"])
     assert rows[0]["source_updated"]
     assert rows[0]["source_version_id"] is None or isinstance(rows[0]["source_version_id"], int)
+    assert all(row["source_present"] is True for row in rows)
+
+
+def test_api_ladder_marks_a_missing_bot_source(live: tuple[App, Client]) -> None:
+    app, client = live
+    app.cfg = replace(app.cfg, bots_dir=app.cfg.root / "different-bot-catalog")
+
+    rows = client.json("/api/ladder")
+
+    alpha = next(row for row in rows if row["name"] == "alpha")
+    assert alpha["source_present"] is False
 
 
 def test_api_ladder_source_recency_comes_from_versions_not_bot_updates(
@@ -1392,7 +1735,8 @@ def test_api_games_list_and_cursor(seeded: tuple[App, Client]) -> None:
     _app, client = seeded
     payload = client.json("/api/games")
 
-    assert set(payload) == {"games", "next"}
+    assert set(payload) == {"games", "next", "latest_match_tag"}
+    assert payload["latest_match_tag"] is None
     assert len(payload["games"]) == 2
     assert payload["next"] is None
     assert payload["games"][0]["id"] > payload["games"][1]["id"]
@@ -1406,6 +1750,21 @@ def test_api_games_list_and_cursor(seeded: tuple[App, Client]) -> None:
     assert page["next"] == page["games"][0]["id"]
 
 
+def test_api_games_marks_the_latest_finite_match_not_a_later_arena(
+    seeded: tuple[App, Client],
+) -> None:
+    app, client = seeded
+    app.store.reserve_batch("latest-match", mode="match", requested_games=0)
+    app.store.reserve_batch("newer-arena", mode="arena", requested_games=None)
+
+    payload = client.json("/api/games?summary=1")
+
+    assert payload["latest_match_tag"] == "latest-match"
+    filtered = client.json("/api/games?summary=1&bot=not-a-real-bot")
+    assert filtered["games"] == []
+    assert filtered["latest_match_tag"] == "latest-match"
+
+
 def test_api_games_summary_has_only_table_fields(seeded: tuple[App, Client]) -> None:
     _app, client = seeded
     payload = client.json("/api/games?summary=1")
@@ -1413,7 +1772,7 @@ def test_api_games_summary_has_only_table_fields(seeded: tuple[App, Client]) -> 
     expected = {
         "id", "a", "b", "map", "rated", "status", "winner",
         "win_condition", "turns", "duration_ms", "resign_message", "error",
-        "has_replay", "tag", "batch_ordinal", "ts",
+        "a_errors", "b_errors", "has_replay", "tag", "batch_ordinal", "ts",
     }
     assert len(payload["games"]) == 2
     assert all(set(game) == expected for game in payload["games"])
@@ -1434,11 +1793,13 @@ def test_api_games_summary_has_only_table_fields(seeded: tuple[App, Client]) -> 
 
 def test_game_summary_preserves_batch_ordinal() -> None:
     payload = servermod.reporting.game_summary_json(
-        Game(tag="webui-match-identity", batch_ordinal=7)
+        Game(tag="webui-match-identity", batch_ordinal=7, a_errors=2, b_errors=3)
     )
 
     assert payload["tag"] == "webui-match-identity"
     assert payload["batch_ordinal"] == 7
+    assert payload["a_errors"] == 2
+    assert payload["b_errors"] == 3
 
 
 def test_api_batch_reports_status_and_limits_in_plan_order(
@@ -1719,6 +2080,11 @@ def test_app_close_force_stops_a_live_arena(app: App, monkeypatch: pytest.Monkey
     """Ctrl-C/server shutdown must cancel workers rather than drain them."""
     calls: list[object] = []
     monkeypatch.setattr(
+        app.scrims,
+        "close",
+        lambda: calls.append(("scrims", "close")),
+    )
+    monkeypatch.setattr(
         app.league,
         "force_stop",
         lambda **kwargs: calls.append(("force", kwargs)) or 0,
@@ -1729,7 +2095,13 @@ def test_app_close_force_stops_a_live_arena(app: App, monkeypatch: pytest.Monkey
 
     app.close()
 
-    assert calls == [("force", {"discard_cancelled": True}), ("wait", 0.25)]
+    assert calls == [
+        ("scrims", "close"),
+        ("force", {"discard_cancelled": True}),
+        ("wait", 0.25),
+    ]
+    assert isinstance(app.platform_history, _PlatformHistoryStub)
+    assert app.platform_history.closed is True
 
 
 def test_api_bot_404(client: Client) -> None:
@@ -1756,7 +2128,10 @@ def test_events_streams_hello_then_live_events(live: tuple[App, Client]) -> None
 
         hello = _read_frame(response)
         assert hello["event"] == "hello"
-        assert "seq" in json.loads(hello["data"])["data"]
+        hello_data = json.loads(hello["data"])["data"]
+        assert "seq" in hello_data
+        assert hello_data["instance"] == app.instance_id
+        assert hello_data["web_revision"] == app.web_revision
 
         app.bus.emit("log", level="info", msg="hello from the test")
         frame = _read_frame(response)
@@ -1818,6 +2193,133 @@ def test_post_match_accepts_and_reports_the_total(live: tuple[App, Client]) -> N
     assert app.store.game_count() == 2
 
 
+def test_post_match_accepts_a_custom_base_seed(live: tuple[App, Client]) -> None:
+    app, client = live
+    status, payload = client.send(
+        "POST",
+        "/api/match",
+        {
+            "a": "alpha",
+            "b": "beta",
+            "maps": ["sprint"],
+            "repeat": 3,
+            "mirror": False,
+            "seed_policy": "fixed",
+            "seed": 0,
+        },
+    )
+
+    assert status == 202
+    assert payload == {"total": 3}
+    assert app.league.wait(timeout=30.0)
+    assert sorted(game.seed for game in app.store.list_games(limit=10)) == [0, 1, 2]
+
+
+def test_post_match_preserves_a_large_custom_seed(live: tuple[App, Client]) -> None:
+    app, client = live
+    status, payload = client.send(
+        "POST",
+        "/api/match",
+        {
+            "a": "alpha",
+            "b": "beta",
+            "maps": ["sprint"],
+            "mirror": False,
+            "seed_policy": "fixed",
+            "seed": "20260802001",
+        },
+    )
+
+    assert status == 202
+    assert payload == {"total": 1}
+    assert app.league.wait(timeout=30.0)
+    assert [game.seed for game in app.store.list_games(limit=10)] == [20_260_802_001]
+
+
+def test_post_match_can_explicitly_choose_random_seeds(
+    live: tuple[App, Client], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, client = live
+    generated = iter((71, 72))
+    monkeypatch.setattr(app.league, "_random_seed", lambda: next(generated))
+
+    status, payload = client.send(
+        "POST",
+        "/api/match",
+        {
+            "a": "alpha",
+            "b": "beta",
+            "maps": ["sprint", "duel"],
+            "mirror": False,
+            "seed_policy": "random",
+            "seed": None,
+        },
+    )
+
+    assert status == 202
+    assert payload == {"total": 2}
+    assert app.league.wait(timeout=30.0)
+    assert sorted(game.seed for game in app.store.list_games(limit=10)) == [71, 72]
+
+
+@pytest.mark.parametrize(
+    "seed_fields",
+    [
+        {"seed_policy": "wrong"},
+        {"seed_policy": "fixed"},
+        {"seed_policy": "fixed", "seed": True},
+        {"seed_policy": "fixed", "seed": -1},
+        {"seed_policy": "fixed", "seed": 2**63},
+        {"seed_policy": "fixed", "seed": 2**63 - 1, "repeat": 2},
+        {"seed_policy": "random", "seed": 7},
+        {"seed": 7},
+    ],
+)
+def test_post_match_rejects_invalid_seed_selection(
+    client: Client, seed_fields: dict[str, Any]
+) -> None:
+    status, payload = client.send(
+        "POST",
+        "/api/match",
+        {"a": "alpha", "b": "beta", "maps": ["sprint"], **seed_fields},
+    )
+
+    assert status == 400
+    assert "seed" in payload["error"]
+
+
+@pytest.mark.parametrize("repeat", [-100, 0, 501])
+def test_post_match_rejects_rounds_outside_the_run_ui(
+    client: Client, repeat: int
+) -> None:
+    status, payload = client.send(
+        "POST",
+        "/api/match",
+        {"a": "alpha", "b": "beta", "maps": ["sprint"], "repeat": repeat},
+    )
+
+    assert status == 400
+    assert "repeat" in payload["error"]
+
+
+def test_post_match_reports_configured_seed_overflow_as_bad_input(
+    live: tuple[App, Client],
+) -> None:
+    app, client = live
+    cfg = replace(app.cfg, seed_policy="fixed", seed=2**63 - 1)
+    app.cfg = cfg
+    app.league.cfg = cfg
+
+    status, payload = client.send(
+        "POST",
+        "/api/match",
+        {"a": "alpha", "b": "beta", "maps": ["sprint"], "repeat": 2},
+    )
+
+    assert status == 400
+    assert "seed" in payload["error"]
+
+
 def test_post_match_can_reserve_an_immutable_tag(
     live: tuple[App, Client],
 ) -> None:
@@ -1854,6 +2356,7 @@ def test_post_match_rejects_an_unknown_bot(client: Client) -> None:
 
 def test_a_second_run_is_a_409(live: tuple[App, Client]) -> None:
     app, client = live
+    config_before = app.cfg.config_path.read_text(encoding="utf-8")
     app.league.start_arena("ladder")
     try:
         assert client.send("POST", "/api/arena", {})[0] == 409
@@ -1869,6 +2372,8 @@ def test_a_second_run_is_a_409(live: tuple[App, Client]) -> None:
         )[0] == 409
         assert client.send("POST", "/api/recompute")[0] == 409
         assert client.send("POST", "/api/reset")[0] == 409
+        assert client.send("POST", "/api/theme", {"theme": "light"})[0] == 409
+        assert app.cfg.config_path.read_text(encoding="utf-8") == config_before
     finally:
         app.league.stop()
         app.league.wait(timeout=30.0)
@@ -1901,6 +2406,21 @@ def test_post_arena_rejects_a_bad_kind(client: Client) -> None:
 
 def test_post_arena_vs_needs_a_target(client: Client) -> None:
     assert client.send("POST", "/api/arena", {"kind": "vs"})[0] == 400
+
+
+def test_post_arena_vs_rejects_a_disabled_target(
+    live: tuple[App, Client],
+) -> None:
+    app, client = live
+    app.store.set_active("beta", False)
+
+    status, payload = client.send(
+        "POST", "/api/arena", {"kind": "vs", "target": "beta"}
+    )
+
+    assert status == 400
+    assert "disabled" in payload["error"]
+    assert app.league.running is False
 
 
 def test_post_sync_returns_a_report(live: tuple[App, Client]) -> None:
@@ -2063,6 +2583,8 @@ def test_a_malformed_body_is_a_400(client: Client) -> None:
 
 _PLATFORM_MATCH_ID = "123e4567-e89b-42d3-a456-426614174000"
 _PLATFORM_TEAM_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+_PLATFORM_OTHER_TEAM_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+_PLATFORM_REQUEST_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 
 
 class _PlatformStub:
@@ -2093,12 +2615,31 @@ class _PlatformStub:
         self.calls.append(("test_runs", limit))
         return {"test_runs": [{"id": "test-run-one"}], "total": 1}
 
+    def team_search(self, query: str, *, limit: int) -> dict[str, Any]:
+        self.calls.append(("team_search", {"query": query, "limit": limit}))
+        return {
+            "teams": [
+                {
+                    "id": _PLATFORM_TEAM_ID,
+                    "name": "Alpha",
+                    "rating": 1500,
+                    "matches_played": 10,
+                }
+            ]
+        }
+
+    def platform_maps(self) -> dict[str, Any]:
+        self.calls.append(("platform_maps", None))
+        return {"maps": [{"name": "sprint"}]}
+
 
 def test_platform_json_routes_validate_and_forward_narrow_arguments(
     app: App, client: Client
 ) -> None:
     platform = _PlatformStub()
     app.platform = platform  # type: ignore[assignment]
+    history = app.platform_history
+    assert isinstance(history, _PlatformHistoryStub)
 
     assert client.json("/api/platform/session")["team"]["name"] == "Alpha"
     matches = client.json(
@@ -2115,11 +2656,76 @@ def test_platform_json_routes_validate_and_forward_narrow_arguments(
             "cursor": "page-two",
         },
     )
+    assert history.calls[-1] == (
+        "observe_matches",
+        [{"id": _PLATFORM_MATCH_ID}],
+    )
     detail = client.json(f"/api/platform/matches/{_PLATFORM_MATCH_ID}")
     assert detail["games"] == [{"number": 1}]
+    assert history.calls[-1] == (
+        "observe_matches",
+        [{"id": _PLATFORM_MATCH_ID}],
+    )
     ladder = client.json("/api/platform/ladder?limit=0")
     assert ladder["total"] == 250
+    assert ladder["rankings"][0]["bot_version"] == 7
+    assert ladder["version_tracking"] == {
+        "started": False,
+        "refreshing": False,
+        "initial_sync_complete": True,
+    }
     assert platform.calls[-1] == ("ladder", 1)
+    assert history.calls[-2:] == [
+        ("request_refresh", platform),
+        ("enrich_ladder", {"rankings": [{"rank": 1}], "total": 250}),
+    ]
+    tracking = client.json("/api/platform/version-tracking")
+    assert tracking["initial_sync_complete"] is True
+    assert tracking["backfill"][0]["match_type"] == "unrated"
+    assert history.calls[-2:] == [("status", None), ("backfill_state", None)]
+
+    run_games = client.json(
+        f"/api/platform/version-history/games?team_id={_PLATFORM_TEAM_ID}&ordinal=2"
+    )
+    assert run_games["record"]["wins"] == 1
+    assert history.calls[-1] == (
+        "run_games",
+        {"team_id": _PLATFORM_TEAM_ID, "ordinal": 2, "limit": 500},
+    )
+    match_runs = client.json(
+        f"/api/platform/version-history/match?match_id={_PLATFORM_MATCH_ID}"
+    )
+    assert match_runs["teams"][0]["ordinal"] == 3
+    assert history.calls[-1] == ("match_runs", {"match_id": _PLATFORM_MATCH_ID})
+    for rejected in (
+        "/api/platform/version-history/match",
+        "/api/platform/version-history/match?match_id=nope",
+        f"/api/platform/version-history/match?match_id={_PLATFORM_MATCH_ID}&extra=1",
+    ):
+        assert client.get(rejected)[0] == 400, rejected
+
+    # team_id is required, and the bounds are enforced at the boundary.
+    for rejected in (
+        "/api/platform/version-history/games",
+        "/api/platform/version-history/games?team_id=nope&ordinal=0",
+        f"/api/platform/version-history/games?team_id={_PLATFORM_TEAM_ID}&ordinal=-1",
+        f"/api/platform/version-history/games?team_id={_PLATFORM_TEAM_ID}&limit=0",
+        f"/api/platform/version-history/games?team_id={_PLATFORM_TEAM_ID}&nope=1",
+    ):
+        assert client.get(rejected)[0] == 400, rejected
+    version_history = client.json(
+        f"/api/platform/version-history?limit=999&team_id={_PLATFORM_TEAM_ID}"
+    )
+    assert version_history["teams"][0]["current_version"] == 7
+    assert history.calls[-1] == (
+        "history",
+        {"team_id": _PLATFORM_TEAM_ID, "limit": 200},
+    )
+    client.json("/api/platform/version-history?limit=0")
+    assert history.calls[-1] == (
+        "history",
+        {"team_id": None, "limit": 1},
+    )
     test_runs = client.json("/api/platform/test-runs?limit=999")
     assert test_runs["test_runs"] == [{"id": "test-run-one"}]
     assert platform.calls[-1] == ("test_runs", 100)
@@ -2129,11 +2735,517 @@ def test_platform_json_routes_validate_and_forward_narrow_arguments(
     assert platform.calls[-1] == ("test_runs", 50)
 
 
+def test_platform_history_failure_does_not_hide_valid_platform_data(
+    app: App, client: Client
+) -> None:
+    class BrokenHistory(_PlatformHistoryStub):
+        def observe_matches(self, rows: Any) -> int:
+            raise sqlite3.OperationalError("disk unavailable")
+
+        def request_refresh(self, *, platform: Any = None) -> dict[str, Any]:
+            raise sqlite3.OperationalError("disk unavailable")
+
+        def enrich_ladder(self, payload: dict[str, Any]) -> dict[str, Any]:
+            raise sqlite3.OperationalError("disk unavailable")
+
+        def status(self) -> dict[str, Any]:
+            raise sqlite3.OperationalError("disk unavailable")
+
+        def history(
+            self, *, team_id: str | None = None, limit: int = 100
+        ) -> dict[str, Any]:
+            raise sqlite3.OperationalError("disk unavailable")
+
+    app.platform = _PlatformStub()  # type: ignore[assignment]
+    app.platform_history = BrokenHistory()  # type: ignore[assignment]
+
+    assert client.json("/api/platform/matches")["next_cursor"] == "next"
+    ladder = client.json("/api/platform/ladder")
+    assert ladder["total"] == 250
+    assert ladder["rankings"] == [{"rank": 1}]
+    assert ladder["version_tracking"]["last_error"] == (
+        "Version tracking is unavailable"
+    )
+    assert client.json("/api/platform/version-tracking")["last_error"] == (
+        "Version tracking is unavailable"
+    )
+    status, payload = client.send("GET", "/api/platform/version-history")
+    assert status == 503
+    assert payload == {"error": "Version tracking is unavailable"}
+
+    class BrokenEnrichment(_PlatformHistoryStub):
+        def enrich_ladder(self, payload: dict[str, Any]) -> dict[str, Any]:
+            raise sqlite3.OperationalError("disk unavailable")
+
+    app.platform_history = BrokenEnrichment()  # type: ignore[assignment]
+    ladder = client.json("/api/platform/ladder")
+    assert ladder["rankings"] == [{"rank": 1}]
+    assert ladder["version_tracking"]["last_error"] == (
+        "Version tracking is unavailable"
+    )
+
+
 def test_platform_team_filter_is_a_canonical_uuid(app: App, client: Client) -> None:
     platform = _PlatformStub()
     app.platform = platform  # type: ignore[assignment]
     client.json(f"/api/platform/matches?team_id={_PLATFORM_TEAM_ID}")
     assert platform.calls[-1][1]["team_id"] == _PLATFORM_TEAM_ID
+
+
+def test_platform_scrim_snapshot_is_local_and_filters_submission_version(
+    app: App, client: Client
+) -> None:
+    scrims = app.scrims
+    assert isinstance(scrims, _ScrimCoordinatorStub)
+
+    payload = client.json("/api/platform/scrims?limit=17&our_version=current")
+    assert payload["limit"] == 17
+    assert payload["our_version"] == "current"
+    assert scrims.calls[-1] == (
+        "snapshot",
+        {"limit": 17, "our_version": "current"},
+    )
+
+    payload = client.json("/api/platform/scrims?our_version=12")
+    assert payload["our_version"] == 12
+    client.json("/api/platform/scrims")
+    assert scrims.calls[-1] == (
+        "snapshot",
+        {"limit": 100, "our_version": None},
+    )
+
+
+def test_platform_team_search_and_map_catalog_are_narrow_proxies(
+    app: App, client: Client
+) -> None:
+    platform = _PlatformStub()
+    app.platform = platform  # type: ignore[assignment]
+
+    teams = client.json("/api/platform/teams?q=Al%20pha&limit=7")
+    assert teams["teams"][0]["name"] == "Alpha"
+    assert platform.calls[-1] == (
+        "team_search",
+        {"query": "Al pha", "limit": 7},
+    )
+    maps = client.json("/api/platform/maps")
+    assert maps == {"maps": [{"name": "sprint"}]}
+    assert platform.calls[-1] == ("platform_maps", None)
+
+
+def test_platform_manual_scrim_is_validated_then_durably_enqueued(
+    app: App, client: Client
+) -> None:
+    status, payload = client.send(
+        "POST",
+        "/api/platform/scrims",
+        {
+            "request_key": _PLATFORM_REQUEST_ID,
+            "opponent_team_id": _PLATFORM_OTHER_TEAM_ID,
+            "opponent_team_name": "Beta",
+            "source_match_id": _PLATFORM_MATCH_ID,
+            "map_names": ["sprint", "duel"],
+        },
+    )
+
+    assert status == 202
+    assert payload["request"]["status"] == "queued"
+    scrims = app.scrims
+    assert isinstance(scrims, _ScrimCoordinatorStub)
+    assert scrims.calls[-1] == (
+        "enqueue_manual",
+        {
+            "request_key": _PLATFORM_REQUEST_ID,
+            "opponent_team_id": _PLATFORM_OTHER_TEAM_ID,
+            "opponent_team_name": "Beta",
+            "source_match_id": _PLATFORM_MATCH_ID,
+            "map_names": ("sprint", "duel"),
+        },
+    )
+
+
+def test_platform_autoscrim_configuration_preserves_target_name_mapping(
+    app: App, client: Client
+) -> None:
+    status, payload = client.send(
+        "POST",
+        "/api/platform/scrims/autoscrim",
+        {
+            "enabled": True,
+            "target_team_ids": [_PLATFORM_OTHER_TEAM_ID],
+            "target_team_names": {_PLATFORM_OTHER_TEAM_ID: "Beta"},
+            "target_matches_per_version": 4,
+            "map_names": ["sprint"],
+        },
+    )
+
+    assert status == 200
+    assert payload["settings"]["enabled"] is True
+    assert payload["settings"]["target_team_names"] == {
+        _PLATFORM_OTHER_TEAM_ID: "Beta"
+    }
+    scrims = app.scrims
+    assert isinstance(scrims, _ScrimCoordinatorStub)
+    assert scrims.calls[-1] == (
+        "configure_autoscrim",
+        {
+            "enabled": True,
+            "target_team_ids": (_PLATFORM_OTHER_TEAM_ID,),
+            "target_team_names": {_PLATFORM_OTHER_TEAM_ID: "Beta"},
+            "target_matches_per_version": 4,
+            "map_names": ("sprint",),
+        },
+    )
+
+
+def test_platform_autoscrim_can_be_disabled_without_validating_a_draft(
+    app: App, client: Client
+) -> None:
+    status, payload = client.send(
+        "POST", "/api/platform/scrims/autoscrim", {"enabled": False}
+    )
+
+    assert status == 200
+    assert payload["settings"] == {
+        "enabled": False,
+        "target_team_ids": [_PLATFORM_OTHER_TEAM_ID],
+    }
+    scrims = app.scrims
+    assert isinstance(scrims, _ScrimCoordinatorStub)
+    assert scrims.calls[-1] == ("disable_autoscrim", None)
+
+
+def test_platform_scrim_refresh_only_wakes_the_coordinator(
+    app: App, client: Client
+) -> None:
+    status, payload = client.send("POST", "/api/platform/scrims/refresh", {})
+
+    assert status == 202
+    assert payload == {"ok": True}
+    scrims = app.scrims
+    assert isinstance(scrims, _ScrimCoordinatorStub)
+    assert scrims.calls[-1] == ("refresh", None)
+
+
+def _raw_scrim_post(
+    client: Client,
+    path: str,
+    body: bytes,
+    headers: dict[str, str],
+) -> tuple[int, dict[str, Any]]:
+    conn = HTTPConnection(client.host, client.port, timeout=10)
+    conn.request("POST", path, body=body, headers=headers)
+    response = conn.getresponse()
+    raw = response.read()
+    conn.close()
+    return response.status, json.loads(raw)
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Content-Type": "text/plain", "Origin": "http://127.0.0.1"},
+        {"Content-Type": "application/json"},
+        {"Content-Type": "application/json", "Origin": "https://evil.example"},
+        {
+            "Content-Type": "application/json",
+            "Host": "rebind.example",
+            "Origin": "http://rebind.example",
+        },
+    ],
+)
+def test_platform_scrim_mutations_reject_csrf_and_rebinding_headers(
+    app: App,
+    client: Client,
+    headers: dict[str, str],
+) -> None:
+    # Fill in a valid direct origin only for the Content-Type case. The other
+    # cases deliberately omit or mismatch it.
+    if headers.get("Content-Type") == "text/plain":
+        headers = {
+            **headers,
+            "Origin": f"http://{client.host}:{client.port}",
+        }
+    status, payload = _raw_scrim_post(
+        client,
+        "/api/platform/scrims/refresh",
+        b"{}",
+        headers,
+    )
+
+    assert status == (415 if headers["Content-Type"] == "text/plain" else 403)
+    assert "error" in payload
+    scrims = app.scrims
+    assert isinstance(scrims, _ScrimCoordinatorStub)
+    assert not scrims.calls
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/platform/scrims",
+        "/api/platform/scrims/autoscrim",
+        "/api/platform/scrims/refresh",
+    ],
+)
+def test_every_platform_scrim_mutation_requires_json(
+    app: App, client: Client, path: str
+) -> None:
+    status, _payload = _raw_scrim_post(
+        client,
+        path,
+        b"{}",
+        {
+            "Content-Type": "text/plain",
+            "Origin": f"http://{client.host}:{client.port}",
+        },
+    )
+
+    assert status == 415
+    scrims = app.scrims
+    assert isinstance(scrims, _ScrimCoordinatorStub)
+    assert not scrims.calls
+
+
+def test_platform_scrim_mutation_accepts_the_tailscale_proxy_origin(
+    app: App, client: Client
+) -> None:
+    status, payload = _raw_scrim_post(
+        client,
+        "/api/platform/scrims/refresh",
+        b"{}",
+        {
+            "Content-Type": "application/json",
+            "Host": "apps.tail5c9691.ts.net:10000",
+            "Origin": "https://apps.tail5c9691.ts.net:10000",
+            "X-Forwarded-Proto": "https",
+        },
+    )
+
+    assert status == 202
+    assert payload == {"ok": True}
+    scrims = app.scrims
+    assert isinstance(scrims, _ScrimCoordinatorStub)
+    assert scrims.calls == [("refresh", None)]
+
+
+def test_platform_scrim_mutation_accepts_an_explicit_custom_proxy_host(
+    app: App, client: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OARENA_TRUSTED_HOSTS", "arena.example.test:9443")
+    status, _payload = _raw_scrim_post(
+        client,
+        "/api/platform/scrims/refresh",
+        b"{}",
+        {
+            "Content-Type": "application/json; charset=utf-8",
+            "Host": "arena.example.test:9443",
+            "Origin": "https://arena.example.test:9443",
+            "X-Forwarded-Proto": "https",
+        },
+    )
+
+    assert status == 202
+    scrims = app.scrims
+    assert isinstance(scrims, _ScrimCoordinatorStub)
+    assert scrims.calls == [("refresh", None)]
+
+
+@pytest.mark.parametrize("bad_name", ["sprint\u0085evil", "sprint\ud800evil"])
+def test_platform_scrim_text_is_utf8_and_rejects_c1_controls_before_enqueue(
+    app: App, client: Client, bad_name: str
+) -> None:
+    status, payload = client.send(
+        "POST",
+        "/api/platform/scrims",
+        {
+            "request_key": _PLATFORM_REQUEST_ID,
+            "opponent_team_id": _PLATFORM_OTHER_TEAM_ID,
+            "map_names": [bad_name],
+        },
+    )
+
+    assert status == 400
+    assert "error" in payload
+    scrims = app.scrims
+    assert isinstance(scrims, _ScrimCoordinatorStub)
+    assert not any(call[0] == "enqueue_manual" for call in scrims.calls)
+
+
+def test_platform_scrim_rejects_non_utf8_json_before_enqueue(
+    app: App, client: Client
+) -> None:
+    status, payload = _raw_scrim_post(
+        client,
+        "/api/platform/scrims",
+        b'{"opponent_team_name":"\xff"}',
+        {
+            "Content-Type": "application/json",
+            "Origin": f"http://{client.host}:{client.port}",
+        },
+    )
+
+    assert status == 400
+    assert "error" in payload
+    scrims = app.scrims
+    assert isinstance(scrims, _ScrimCoordinatorStub)
+    assert not any(call[0] == "enqueue_manual" for call in scrims.calls)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/platform/scrims?extra=1",
+        "/api/platform/scrims?limit=0",
+        "/api/platform/scrims?limit=201",
+        "/api/platform/scrims?limit=lots",
+        "/api/platform/scrims?our_version=0",
+        "/api/platform/scrims?our_version=01",
+        "/api/platform/scrims?our_version=latest",
+        "/api/platform/teams",
+        "/api/platform/teams?q=",
+        "/api/platform/teams?q=alpha&limit=0",
+        "/api/platform/teams?q=alpha&limit=21",
+        "/api/platform/maps?extra=1",
+    ],
+)
+def test_platform_scrim_query_validation_is_strict(
+    client: Client, path: str
+) -> None:
+    status, payload = client.send("GET", path)
+    assert status == 400
+    assert "error" in payload
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        (
+            "/api/platform/scrims",
+            {"opponent_team_id": _PLATFORM_OTHER_TEAM_ID},
+        ),
+        (
+            "/api/platform/scrims",
+            {
+                "request_key": _PLATFORM_REQUEST_ID,
+                "opponent_team_id": _PLATFORM_OTHER_TEAM_ID,
+                "surprise": True,
+            },
+        ),
+        (
+            "/api/platform/scrims",
+            {
+                "request_key": "not-a-uuid",
+                "opponent_team_id": _PLATFORM_OTHER_TEAM_ID,
+            },
+        ),
+        (
+            "/api/platform/scrims",
+            {
+                "request_key": _PLATFORM_REQUEST_ID,
+                "opponent_team_id": _PLATFORM_OTHER_TEAM_ID.upper(),
+            },
+        ),
+        (
+            "/api/platform/scrims",
+            {
+                "request_key": _PLATFORM_REQUEST_ID,
+                "opponent_team_id": _PLATFORM_OTHER_TEAM_ID,
+                "source_match_id": "not-a-uuid",
+            },
+        ),
+        (
+            "/api/platform/scrims",
+            {
+                "request_key": _PLATFORM_REQUEST_ID,
+                "opponent_team_id": _PLATFORM_OTHER_TEAM_ID,
+                "map_names": ["one", "two", "three", "four", "five", "six"],
+            },
+        ),
+        (
+            "/api/platform/scrims",
+            {
+                "request_key": _PLATFORM_REQUEST_ID,
+                "opponent_team_id": _PLATFORM_OTHER_TEAM_ID,
+                "map_names": "sprint",
+            },
+        ),
+        (
+            "/api/platform/scrims/autoscrim",
+            {"target_team_ids": [_PLATFORM_OTHER_TEAM_ID]},
+        ),
+        (
+            "/api/platform/scrims/autoscrim",
+            {
+                "enabled": True,
+                "target_team_ids": [_PLATFORM_OTHER_TEAM_ID] * 101,
+            },
+        ),
+        (
+            "/api/platform/scrims/autoscrim",
+            {
+                "enabled": True,
+                "target_team_ids": [_PLATFORM_OTHER_TEAM_ID],
+                "target_team_names": {_PLATFORM_TEAM_ID: "not selected"},
+            },
+        ),
+        (
+            "/api/platform/scrims/autoscrim",
+            {"enabled": True, "target_matches_per_version": -1},
+        ),
+        (
+            "/api/platform/scrims/autoscrim",
+            {"enabled": True, "target_matches_per_version": 101},
+        ),
+        (
+            "/api/platform/scrims/autoscrim",
+            {"enabled": True, "target_matches_per_version": "3"},
+        ),
+        ("/api/platform/scrims/refresh", {"unexpected": True}),
+    ],
+)
+def test_platform_scrim_payload_validation_is_strict(
+    client: Client, path: str, payload: dict[str, Any]
+) -> None:
+    status, response = client.send("POST", path, payload)
+    assert status == 400
+    assert "error" in response
+
+
+def test_platform_scrim_coordinator_validation_is_a_safe_400(
+    app: App, client: Client
+) -> None:
+    scrims = app.scrims
+    assert isinstance(scrims, _ScrimCoordinatorStub)
+    scrims.validation_error = "target is your own team"
+    status, payload = client.send(
+        "POST",
+        "/api/platform/scrims",
+        {
+            "request_key": _PLATFORM_REQUEST_ID,
+            "opponent_team_id": _PLATFORM_OTHER_TEAM_ID,
+        },
+    )
+    assert status == 400
+    assert payload == {"error": "target is your own team"}
+
+    scrims.validation_error = "Refresh your FCode account before requesting scrims"
+    status, payload = client.send(
+        "POST",
+        "/api/platform/scrims/autoscrim",
+        {
+            "enabled": True,
+            "target_team_ids": [_PLATFORM_OTHER_TEAM_ID],
+        },
+    )
+    assert status == 400
+    assert payload == {
+        "error": "Refresh your FCode account before requesting scrims"
+    }
+
+    scrims.validation_error = "private\nunsafe detail"
+    status, payload = client.send("GET", "/api/platform/scrims")
+    assert status == 400
+    assert payload == {"error": "invalid scrim request"}
 
 
 def test_platform_replay_is_same_origin_immutable_and_octet_stream(
@@ -2164,6 +3276,11 @@ def test_platform_replay_is_same_origin_immutable_and_octet_stream(
         f"/api/platform/matches?mine=1&team_id={_PLATFORM_TEAM_ID}",
         f"/api/platform/matches?team_id={_PLATFORM_TEAM_ID.upper()}",
         "/api/platform/ladder?cursor=unexpected",
+        "/api/platform/version-history?cursor=unexpected",
+        "/api/platform/version-history?limit=not-a-number",
+        "/api/platform/version-history?limit=1&limit=2",
+        f"/api/platform/version-history?team_id={_PLATFORM_TEAM_ID.upper()}",
+        "/api/platform/version-tracking?cursor=unexpected",
         "/api/platform/test-runs?cursor=unexpected",
         "/api/platform/test-runs?limit=not-a-number",
         "/api/platform/test-runs?limit=1&limit=2",
@@ -2205,6 +3322,48 @@ def test_typed_platform_errors_keep_their_status(app: App, client: Client) -> No
 # --------------------------------------------------------------------------- #
 
 
+def test_app_creates_platform_helpers_in_the_project_state_directory(
+    project: Project, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured_scrims: dict[str, Any] = {}
+    captured_history: dict[str, Any] = {}
+
+    class CapturingCoordinator(_ScrimCoordinatorStub):
+        def __init__(self, path: Path, platform: Any, *, bus: Any) -> None:
+            super().__init__()
+            captured_scrims.update(path=path, platform=platform, bus=bus)
+
+    class CapturingHistory(_PlatformHistoryStub):
+        def __init__(self, path: Path, platform: Any) -> None:
+            super().__init__()
+            captured_history.update(path=path, platform=platform)
+
+    platform = _PlatformStub()
+    monkeypatch.setattr(servermod, "ScrimCoordinator", CapturingCoordinator)
+    monkeypatch.setattr(servermod, "PlatformVersionHistory", CapturingHistory)
+    created = App(
+        project.cfg,
+        project.store,
+        project.bus,
+        project.league,
+        project.rater,
+        platform_client=platform,  # type: ignore[arg-type]
+    )
+
+    assert captured_scrims == {
+        "path": project.cfg.state_dir / "platform-scrims.db",
+        "platform": platform,
+        "bus": project.bus,
+    }
+    assert captured_history == {
+        "path": project.cfg.state_dir / "platform-history.db",
+        "platform": platform,
+    }
+    assert created.scrims is not None
+    created.scrims.close()
+    created.platform_history.close()
+
+
 def test_app_create_builds_the_whole_stack(project: Project) -> None:
     app = App.create(project.cfg, workers=2)
     try:
@@ -2243,3 +3402,52 @@ def test_safe_join_refuses_to_escape(tmp_path: Path) -> None:
     assert servermod._safe_join(tmp_path, "inside.txt") == (tmp_path / "inside.txt").resolve()
     assert servermod._safe_join(tmp_path, "../outside") is None
     assert servermod._safe_join(tmp_path, "") is None
+
+
+def test_serve_starts_while_another_process_holds_the_writer_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent match run must not take the dashboard down.
+
+    `oarena serve --reload` restarts on any bot-source edit, and its startup
+    catalog sync wants the arena-wide single-writer lease. During someone
+    else's run that lease is taken, so the server exited and the reloader
+    served 502 for the length of the run.
+    """
+    cfg = make_project(tmp_path)
+    bound: dict[str, Any] = {}
+
+    class _Served(RuntimeError):
+        """Raised in place of blocking forever, once the port is bound."""
+
+    def fake_make_server(app: Any, host: str, port: int, **kwargs: Any) -> Any:
+        bound["host"], bound["port"] = host, port
+        raise _Served
+
+    monkeypatch.setattr(servermod, "make_server", fake_make_server)
+
+    busy = StoreBusyError(
+        "another oarena writer is active for .oarena "
+        '({"pid":1,"purpose":"rated run match tag=sweep"})'
+    )
+    synced: list[bool] = []
+
+    def refuse_sync() -> None:
+        synced.append(True)
+        raise busy
+
+    real_create = servermod.App.create
+
+    def create(config: Any, **kwargs: Any) -> Any:
+        app = real_create(config, **kwargs)
+        monkeypatch.setattr(app.league, "sync", refuse_sync)
+        return app
+
+    monkeypatch.setattr(servermod.App, "create", staticmethod(create))
+
+    with pytest.raises(_Served):
+        servermod.serve(cfg, host="127.0.0.1", port=0, open_browser=False)
+
+    # The sync was attempted, refused, and the port was bound regardless.
+    assert synced == [True]
+    assert bound["port"] == 0

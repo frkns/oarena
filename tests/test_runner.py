@@ -65,6 +65,18 @@ def test_a_clean_game_maps_the_engine_result(spec_factory) -> None:
     assert outcome.fcode_metadata == FAKE_FCODE_METADATA
     assert outcome.a == PlayerResult(titanium=7427, mined=4880, units=4, buildings=40)
     assert outcome.b == PlayerResult(titanium=2198, mined=0, units=15, buildings=20)
+    assert outcome.ruleset_result is None
+
+
+@pytest.mark.usefixtures("worker_script")
+def test_ruleset_contract_and_result_cross_the_worker_boundary(spec_factory) -> None:
+    ruleset = {"name": "flow_benchmark", "seed": 17, "nested": {"m": 1000}}
+    spec = replace(spec_factory("alpha", "beta"), ruleset=ruleset)
+
+    outcome = run_and_clean(spec)
+
+    assert outcome.status == "ok"
+    assert outcome.ruleset_result == {"echo": ruleset}
 
 
 @pytest.mark.usefixtures("worker_script")

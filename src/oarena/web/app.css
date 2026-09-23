@@ -422,6 +422,7 @@ hr, .hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
 .view-sub { font-size: var(--fs-sm); font-weight: 400; color: var(--fg-mute); }
 .view-crumbs { display: flex; align-items: center; gap: 6px; color: var(--fg-mute); font-size: var(--fs-sm); }
 .view-crumbs a:hover { color: var(--accent); }
+.game-error-mark { align-self: center; min-width: 18px; padding-inline: 4px; justify-content: center; }
 
 .toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-left: auto; }
 .filters { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
@@ -596,6 +597,7 @@ hr, .hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
 
 .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1 1 auto; }
 .field-narrow { flex: 0 0 auto; width: 12ch; }
+.field-seed { width: 24ch; }
 .field-row { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
 .field-head { display: flex; align-items: center; gap: 8px; }
 .field-actions { display: flex; gap: 4px; margin-left: auto; }
@@ -801,6 +803,22 @@ hr, .hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
 }
 .chip-toggle .chip-dim { color: var(--fg-mute); font-size: var(--fs-xs); }
 
+.run-map-preview {
+  position: fixed;
+  z-index: var(--z-tip);
+  width: min(220px, calc(100vw - 16px));
+  overflow: hidden;
+  pointer-events: none;
+  background: var(--bg-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.run-map-preview .map-canvas { border-bottom-color: var(--line-strong); }
+.run-map-preview-meta { display: flex; flex-direction: column; gap: 1px; padding: 6px 8px; }
+.run-map-preview-name { color: var(--fg); font-size: var(--fs-sm); font-weight: 600; }
+.run-map-preview-dims { color: var(--fg-mute); font-size: var(--fs-xs); }
+
 /* delta chip (rating change after a game) */
 .delta-chip {
   display: inline-flex;
@@ -1002,6 +1020,7 @@ kbd {
   font-size: var(--fs-xs);
   white-space: nowrap;
 }
+.game-batch-score { color: var(--fg); font-weight: 600; }
 .game-batch-links {
   display: flex;
   min-width: 0;
@@ -1034,18 +1053,26 @@ kbd {
 }
 .game-batch-map { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .game-batch-result {
-  display: inline-grid;
-  width: 16px;
-  height: 16px;
-  place-items: center;
-  border-radius: 50%;
-  background: var(--draw-soft);
-  color: var(--draw);
-  font-size: 9px;
+  display: block;
+  min-width: 4ch;
+  max-width: 18ch;
+  height: 18px;
+  overflow: hidden;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--win-soft);
+  color: var(--win);
+  font-size: 10px;
   font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
+.game-batch-result[data-result="draw"] { background: var(--draw-soft); color: var(--draw); }
 .game-batch-link[data-status]:not([data-status="ok"]) .game-batch-result { background: var(--loss-soft); color: var(--loss); }
 .game-batch-all { flex: 0 0 auto; color: var(--accent); font-size: var(--fs-xs); white-space: nowrap; }
+.game-batch-toggle { flex: 0 0 auto; }
 .viz-frame {
   position: relative;
   border: 1px solid var(--line);
@@ -1104,7 +1131,14 @@ kbd {
 button.fcode-team:hover, button.fcode-team:focus-visible { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
 .fcode-team.is-winner { color: var(--win); font-weight: 600; }
 .fcode-team.is-loser { color: var(--fg-mute); }
-.fcode-game-tabs { display: grid; grid-template-columns: repeat(5, minmax(74px, 1fr)); gap: 4px; }
+.fcode-game-tabs {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(108px, 1fr));
+  gap: 4px;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: thin;
+}
 .fcode-game-btn {
   display: flex;
   align-items: center;
@@ -1124,18 +1158,23 @@ button.fcode-team:hover, button.fcode-team:focus-visible { color: var(--accent);
 .fcode-game-btn:disabled { opacity: .4; cursor: not-allowed; }
 .fcode-game-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fcode-game-result {
-  display: inline-grid;
-  place-items: center;
-  width: 15px;
-  height: 15px;
-  flex: 0 0 15px;
-  border-radius: 50%;
-  background: var(--draw-soft);
-  color: var(--draw);
-  font-size: 9px;
+  display: block;
+  min-width: 3ch;
+  max-width: 14ch;
+  height: 18px;
+  flex: 1 1 auto;
+  overflow: hidden;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--win-soft);
+  color: var(--win);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.fcode-game-result.side-a { background: var(--a-soft); color: var(--a); }
-.fcode-game-result.side-b { background: var(--b-soft); color: var(--b); }
 .fcode-provenance {
   grid-column: 1 / -1;
   color: var(--fg-mute);
@@ -1144,7 +1183,9 @@ button.fcode-team:hover, button.fcode-team:focus-visible { color: var(--accent);
 }
 .fcode-browse-grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(320px, .75fr); gap: 10px; }
 .fcode-browse-grid.is-single { grid-template-columns: minmax(0, 1fr); }
-.fcode-browse-grid > .card { min-width: 0; align-self: start; }
+.fcode-browse-grid > .card,
+.fcode-side-stack > .card { min-width: 0; align-self: start; }
+.fcode-side-stack { display: grid; gap: 10px; min-width: 0; align-self: start; }
 .fcode-browse-grid .card-head { min-height: 36px; flex-wrap: wrap; }
 .fcode-browse-grid .card-actions { flex-wrap: wrap; }
 .fcode-panel-body { min-width: 0; }
@@ -1153,13 +1194,230 @@ button.fcode-team:hover, button.fcode-team:focus-visible { color: var(--accent);
 .fcode-recent-filters .seg-btn { height: 22px; padding: 0 7px; font-size: var(--fs-xs); }
 .fcode-chip-clear { color: inherit; line-height: 1; }
 .fcode-chip-clear:hover { color: var(--fg); }
-.fcode-matchup { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 5px; }
+/* Cap the pairing so two short team names stay a readable pair instead of being
+   flung to opposite ends of a wide column; "vs" still lines up down the table. */
+.fcode-matchup {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+  max-inline-size: 46ch;
+}
 .fcode-matchup .fcode-team:last-child { text-align: right; }
 .fcode-match-row:focus-visible { outline-offset: -2px; }
 .fcode-recent-table th:nth-child(1) { width: 9ch; }
 .fcode-recent-table th:nth-child(3) { width: 7ch; }
 .fcode-recent-table th:nth-child(4) { width: 9ch; }
-.fcode-test-error { max-width: 36ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* An expandable version run: the head is a button, the games hang under it. */
+.fcode-version-run-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.fcode-version-run-head:disabled { cursor: default; }
+.fcode-version-run-head:not(:disabled):hover strong { color: var(--accent); }
+.fcode-run-caret { color: var(--fg-mute); font-size: var(--fs-xs); inline-size: 1ch; }
+.fcode-version-run-head:disabled .fcode-run-caret { visibility: hidden; }
+.fcode-run-games { margin-top: 6px; display: grid; gap: 5px; }
+.fcode-run-summary { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.fcode-run-game-list {
+  display: grid;
+  gap: 1px;
+  max-block-size: 260px;
+  overflow: auto;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+}
+.fcode-run-game {
+  display: grid;
+  /* The kind badge sizes to its own text; a fixed column let "unrated" spill
+     over the opponent name beside it. */
+  grid-template-columns: 7ch auto minmax(0, 1fr) 5ch 5ch auto;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 7px;
+  color: var(--fg-dim);
+  font-size: var(--fs-xs);
+  text-decoration: none;
+  background: var(--bg-2);
+}
+.fcode-run-game:hover { background: var(--bg-3); color: var(--fg); }
+.fcode-run-kind { justify-self: start; color: var(--fg-mute); white-space: nowrap; }
+.fcode-run-opponent { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fcode-run-score { color: var(--fg); }
+.fcode-run-result { justify-self: end; text-transform: capitalize; }
+.fcode-run-game[data-result="win"] .fcode-run-result { color: var(--win); }
+.fcode-run-game[data-result="loss"] .fcode-run-result { color: var(--loss); }
+.fcode-run-game[data-result="draw"] .fcode-run-result { color: var(--draw); }
+.fcode-run-game[data-result="pending"] .fcode-run-result { color: var(--fg-mute); }
+.fcode-run-game[data-result="unknown"] .fcode-run-result { color: var(--fg-mute); }
+
+.fcode-test-state { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+.fcode-test-state .small { color: var(--fg-mute); }
+.fcode-test-error { max-width: 36ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-xs); }
+.fcode-ladder-table th:nth-child(1) { width: 4ch; }
+.fcode-ladder-table th:nth-child(3) { width: 17ch; }
+.fcode-ladder-table th:nth-child(4) { width: 8ch; }
+.fcode-ladder-table th:nth-child(5) { width: 8ch; }
+.fcode-ladder-table .fcode-team { max-width: 18ch; }
+.fcode-bot-version {
+  display: block;
+  max-width: 17ch;
+  overflow: hidden;
+  color: var(--fg-dim);
+  font-size: var(--fs-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fcode-version-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--loss-soft);
+  font-size: var(--fs-sm);
+}
+.fcode-version-team-select { max-width: 22ch; }
+.fcode-version-actions { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.fcode-version-quick[hidden] { display: none; }
+.fcode-version-quick-btn { display: inline-flex; align-items: center; gap: 5px; max-width: 16ch; }
+.fcode-version-quick-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fcode-version-quick-btn .tiny { color: var(--fg-mute); }
+.fcode-version-quick-btn[aria-pressed="true"] .tiny { color: inherit; }
+.fcode-version-history > .empty { min-height: 130px; border: 0; }
+.fcode-version-timeline .timeline-ts { min-width: 7ch; }
+.fcode-version-run-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+
+/* Official unrated scrims. These reuse the FCode tab's compact controls and
+   tables; only the two configuration cards and their live status need layout. */
+.scrim-session {
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-1);
+}
+.scrim-summary { align-items: stretch; }
+.scrim-summary > .stat { flex: 1 1 150px; }
+.scrim-summary > .panel { flex: 1 1 100%; }
+.scrim-config-grid { align-items: start; }
+.scrim-config-grid > .card { height: 100%; }
+.scrim-form { gap: 10px; }
+.scrim-form .field-hint { line-height: 1.35; }
+.scrim-team-picker { width: 100%; }
+.scrim-top-teams { min-height: 24px; }
+.scrim-top-teams .chip-set { max-height: 92px; }
+.scrim-map-slot .map-picker-head { justify-content: flex-start; gap: 6px; }
+.scrim-targets { min-height: 22px; }
+.scrim-targets .chip-set { max-height: 92px; }
+.scrim-targets .fcode-chip-clear { margin-left: 1px; }
+.scrim-count-field { max-width: 34rem; }
+.scrim-topk { width: 7ch; flex: 0 0 7ch; }
+.scrim-target-count { width: 8ch; }
+.scrim-submit-row { min-height: 28px; }
+.scrim-blocked { flex: 1 1 220px; }
+.scrim-status-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--fg-mute);
+  font-size: var(--fs-sm);
+}
+.scrim-status[data-status="ready"],
+.scrim-status[data-status="idle"],
+.scrim-status[data-status="coverage_complete"],
+.scrim-status[data-status="complete"] { color: var(--win); background: var(--win-soft); border-color: color-mix(in srgb, var(--win) 32%, transparent); }
+.scrim-status[data-status="waiting"],
+.scrim-status[data-status="queued"],
+.scrim-status[data-status="accepted"],
+.scrim-status[data-status="sending"],
+.scrim-status[data-status="running"],
+.scrim-status[data-status="submitting"] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-line); }
+.scrim-status[data-status="backoff"],
+.scrim-status[data-status="rate_limited"],
+.scrim-status[data-status="paused"] { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 32%, transparent); }
+.scrim-status[data-status="failed"],
+.scrim-status[data-status="error"],
+.scrim-status[data-status="unknown"],
+.scrim-status[data-status="outcome_unknown"],
+.scrim-status.scrim-status-error { color: var(--loss); background: var(--loss-soft); border-color: color-mix(in srgb, var(--loss) 32%, transparent); }
+.scrim-status[data-status="cancelled"] { color: var(--fg-mute); background: var(--bg-2); border-color: var(--line); }
+.scrim-version-select { width: auto; min-width: 15ch; height: 24px; font-size: var(--fs-sm); }
+.scrim-panel-body { min-width: 0; }
+.scrim-panel-body > .empty { border: 0; border-radius: 0; min-height: 150px; }
+.scrim-opponent-table th:nth-child(2) { width: 12ch; }
+.scrim-opponent-table th:nth-child(n+3) { width: 13ch; }
+/* When | Opponent | Versions | Maps | Score | Status | action */
+.scrim-history-table th:nth-child(1) { width: 9ch; }
+.scrim-history-table th:nth-child(3) { width: 13ch; }
+.scrim-history-table th:nth-child(5) { width: 7ch; }
+.scrim-history-table th:nth-child(6) { width: 26ch; }
+.scrim-history-who { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.scrim-history-who > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scrim-source { color: var(--fg-mute); flex: none; }
+.scrim-history-state { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+.scrim-history-maps,
+.scrim-history-error {
+  max-width: 28ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scrim-history-error { color: var(--fg-mute); font-size: var(--fs-xs); max-width: 26ch; }
+
+/* One line that answers "is autoscrim still running?" without reading a table. */
+.scrim-banner-slot:empty { display: none; }
+.scrim-banner {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-2);
+}
+.scrim-banner-dot {
+  flex: none;
+  inline-size: 8px;
+  block-size: 8px;
+  border-radius: 50%;
+  background: var(--fg-mute);
+}
+.scrim-banner-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.scrim-banner-text strong { font-weight: 600; font-size: var(--fs-sm); }
+.scrim-banner-detail {
+  color: var(--fg-mute);
+  font-size: var(--fs-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scrim-banner > time { margin-left: auto; color: var(--fg-mute); font-size: var(--fs-sm); white-space: nowrap; }
+.scrim-banner > .btn { margin-left: auto; flex: none; }
+.scrim-banner > time + .btn { margin-left: 0; }
+.scrim-banner[data-tone="good"] { border-color: color-mix(in srgb, var(--win) 34%, var(--line)); background: var(--win-soft); }
+.scrim-banner[data-tone="good"] .scrim-banner-dot { background: var(--win); }
+.scrim-banner[data-tone="wait"],
+.scrim-banner[data-tone="warn"] { border-color: color-mix(in srgb, var(--warn) 34%, var(--line)); background: var(--warn-soft); }
+.scrim-banner[data-tone="wait"] .scrim-banner-dot,
+.scrim-banner[data-tone="warn"] .scrim-banner-dot { background: var(--warn); }
+.scrim-banner[data-tone="bad"] { border-color: color-mix(in srgb, var(--loss) 40%, var(--line)); background: var(--loss-soft); }
+.scrim-banner[data-tone="bad"] .scrim-banner-dot { background: var(--loss); }
+.scrim-history-table tr[data-status="failed"] td:first-child,
+.scrim-history-table tr[data-status="error"] td:first-child,
+.scrim-history-table tr[data-status="unknown"] td:first-child,
+.scrim-history-table tr[data-status="outcome_unknown"] td:first-child { box-shadow: inset 2px 0 0 var(--loss); }
 
 /* The Square viewer is a shell-level portal rather than a child of the current
    route. Keep its iframe alive at a real, non-zero render size while parked;
@@ -1510,6 +1768,9 @@ button.fcode-team:hover, button.fcode-team:focus-visible { color: var(--accent);
 .game-row[data-status="bot_error"] td:first-child,
 .game-row[data-status="engine_error"] td:first-child { box-shadow: inset 2px 0 0 var(--loss); }
 .game-row[data-rated="false"] .col-time { opacity: .6; }
+.game-row.is-latest-match,
+.game-row.is-latest-match:hover { background: var(--accent-soft); }
+.game-row.is-latest-match td:last-child { box-shadow: inset -2px 0 0 var(--accent); }
 .game-row.is-new { animation: rowflash 900ms var(--ease); }
 .game-reason { color: var(--loss); font-size: var(--fs-sm); overflow: hidden; text-overflow: ellipsis; }
 
@@ -1802,6 +2063,8 @@ button.fcode-team:hover, button.fcode-team:focus-visible { color: var(--accent);
 .storage-meter-wrap { display: grid; gap: 6px; margin-top: 12px; }
 .storage-meter { height: 7px; overflow: hidden; border-radius: 99px; background: var(--bg-3); }
 .storage-meter > span { display: block; height: 100%; min-width: 2px; border-radius: inherit; background: var(--accent); }
+/* Past the cap, pruning has not caught up yet -- worth seeing, not hiding. */
+.storage-meter[data-over="true"] > span { background: var(--warn); }
 .storage-other { display: grid; grid-template-columns: 1fr auto; gap: 9px 18px; align-items: baseline; color: var(--fg-mute); }
 .storage-other strong { color: var(--fg); font-weight: 550; }
 .storage-controls { margin-top: 12px; }
@@ -1876,6 +2139,18 @@ button.fcode-team:hover, button.fcode-team:focus-visible { color: var(--accent);
   background: var(--line-strong);
 }
 .timeline-item[data-current="true"]::before { background: var(--accent); }
+/* The run whose version is playing in the match open above. */
+.timeline-item[data-playing="true"] {
+  border-left-color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 0 var(--radius) var(--radius) 0;
+}
+.timeline-item[data-playing="true"]::before { background: var(--accent); }
+.fcode-version-playing {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+}
 .timeline-ts { color: var(--fg-mute); font-size: var(--fs-sm); flex: 0 0 auto; }
 .timeline-body { color: var(--fg-dim); min-width: 0; overflow-wrap: anywhere; }
 
@@ -2137,9 +2412,8 @@ button.fcode-team:hover, button.fcode-team:focus-visible { color: var(--accent);
   .fcode-game-number { grid-column: 2; width: 6ch; }
   .fcode-viz { block-size: clamp(320px, calc(100dvh - 190px), 620px); }
   .fcode-match-bar { grid-template-columns: minmax(0, 1fr); }
-  .fcode-game-tabs { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  .fcode-game-tabs { grid-template-columns: repeat(5, minmax(108px, 1fr)); }
   .fcode-game-btn { padding: 0 4px; }
-  .fcode-game-result { display: none; }
   .viz-frame { block-size: clamp(300px, calc(100dvh - 105px), 620px); }
   .viz-frame.fcode-viz { block-size: clamp(320px, calc(100dvh - 190px), 620px); }
   .game-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }

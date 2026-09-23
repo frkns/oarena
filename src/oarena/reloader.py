@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from . import bots as botsmod
 from . import config as configmod
 from .config import Config
 
@@ -137,6 +138,7 @@ def watch_paths(cfg: Config) -> tuple[Path, ...]:
         _absolute(cfg.extra_maps_dir),
         _absolute(cfg.config_path),
     }
+    paths.update(botsmod.mounted_catalog_roots(cfg.bots_dir))
     try:
         paths.add(_absolute(configmod.fcode_engine_root()))
     except RuntimeError:

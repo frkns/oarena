@@ -20,10 +20,29 @@ import {
   loadPlatformSelection,
   normalizePlatformGame,
   parsePlatformMatchInput,
+  platformGameWinnerName,
+  platformTeamOutcome,
   platformViewHash,
   savePlatformSelection,
 } from "./platform-form.js";
-import { extractProfilerReports, normaliseProfilerRecords } from "./telemetry.js";
+import { isLatestMatchGame } from "./run-form.js";
+import { createMapPreview } from "./map-preview.js";
+import { batchOverallResult, batchScore, batchScoreTitle } from "./match-score.js";
+import { playedRunOrdinal as resolvePlayedRunOrdinal } from "./version-runs.js";
+import {
+  buildAutoscrimConfig,
+  buildScrimRequest,
+  canonicalScrimUuid,
+  newScrimRequestKey,
+  normalizeScrimMaps,
+  SCRIM_MAP_MAX,
+} from "./scrim-form.js";
+import {
+  extractProfilerReports,
+  normaliseProfilerRecords,
+  PROFILER_SPAN_MODES,
+  profilerSpanMetric,
+} from "./telemetry.js";
 
 /* -------------------------------------------------------------------------- */
 /* DOM helpers                                                                */
@@ -323,6 +342,15 @@ function statusBadge(game) {
     text: STATUS_LABEL[game.status] || game.status,
     title: game.error || "",
   });
+}
+
+function gameHasError(game) {
+  return Boolean(
+    game &&
+    (game.status !== "ok" ||
+      (Number(game.a_errors) || 0) > 0 ||
+      (Number(game.b_errors) || 0) > 0)
+  );
 }
 
 function matchup(game) {
@@ -1529,10 +1557,25 @@ const STREAM_CAP = 200;
 const GAMES_CACHE_MAX_AGE_MS = 5_000;
 const MATCH_GAMES_CACHE_MAX_AGE_MS = 60_000;
 const MATCH_GAMES_CACHE_LIMIT = 16;
+const GAME_BATCH_PREVIEW_LIMIT = 12;
 
 let gamesFirstPageCache = null;
 let gamesFirstPageInflight = null;
+let latestMatchRunRevision = 0;
+let latestMatchLiveTag = "";
 const matchGamesCache = new Map();
+
+function startedMatchTag(payload) {
+  const tag = payload?.batch_tag;
+  return payload?.mode === "match" &&
+    typeof tag === "string" &&
+    tag.length > 0 &&
+    tag.length <= 200 &&
+    tag.trim() === tag &&
+    !/[\u0000-\u001f\u007f]/.test(tag)
+    ? tag
+    : "";
+}
 
 function gameQuery(filter, before) {
   const q = new URLSearchParams();
@@ -1569,6 +1612,7 @@ function sameGamesPage(left, right) {
   const b = right?.games;
   return (
     left?.next === right?.next &&
+    left?.latest_match_tag === right?.latest_match_tag &&
     Array.isArray(a) &&
     Array.isArray(b) &&
     a.length === b.length &&
@@ -1585,8 +1629,13 @@ function requestGamesFirstPage({ force = false } = {}) {
     return Promise.resolve(gamesFirstPageCache.page);
   }
   if (gamesFirstPageInflight) return gamesFirstPageInflight;
+  const requestRevision = latestMatchRunRevision;
   gamesFirstPageInflight = api(gameQuery(EMPTY_GAME_FILTER, null))
-    .then(rememberGamesFirstPage)
+    .then((page) => rememberGamesFirstPage(
+      requestRevision === latestMatchRunRevision
+        ? page
+        : { ...page, latest_match_tag: latestMatchLiveTag },
+    ))
     .finally(() => {
       gamesFirstPageInflight = null;
     });
@@ -1637,8 +1686,23 @@ on("game", (payload) => {
     PAGE,
   );
   rememberGamesFirstPage({
+    ...cached,
     games,
     next: games.length === PAGE ? games.at(-1)?.id ?? null : null,
+  });
+});
+
+// A newly reserved finite Match supersedes the previous highlight even before
+// its first game finishes. This also keeps the short-lived warm cache honest.
+on("run_started", (payload) => {
+  const tag = startedMatchTag(payload);
+  if (!tag) return;
+  latestMatchRunRevision += 1;
+  latestMatchLiveTag = tag;
+  if (!gamesFirstPageCache?.page) return;
+  rememberGamesFirstPage({
+    ...gamesFirstPageCache.page,
+    latest_match_tag: tag,
   });
 });
 
@@ -1670,6 +1734,7 @@ const games = mount("games", (root, params, ctx) => {
   let rows = [];
   let next = null;
   let cap = STREAM_CAP;
+  let latestMatchTag = "";
 
   const tbody = el("tbody");
   const table = el(
@@ -1777,7 +1842,8 @@ const games = mount("games", (root, params, ctx) => {
   }
 
   function buildRow(game, fresh) {
-    const failed = game.status !== "ok" || game.a_errors || game.b_errors;
+    const failed = gameHasError(game);
+    const latestMatch = isLatestMatchGame(game, latestMatchTag);
     const detail = failed
       ? game.error || game.resign_message || conditionLabel(game.win_condition) || ""
       : game.resign_message || game.win_condition || "";
@@ -1787,12 +1853,14 @@ const games = mount("games", (root, params, ctx) => {
     const tr = el(
       "tr",
       {
-        class: "game-row" + (fresh ? " is-new" : ""),
+        class: `game-row${latestMatch ? " is-latest-match" : ""}${fresh ? " is-new" : ""}`,
         "data-status": game.status === "ok" && (game.a_errors || game.b_errors)
           ? "bot_error"
           : game.status,
         "data-rated": game.rated ? "true" : "false",
+        "data-latest-match": latestMatch ? "true" : null,
         "data-id": String(game.id),
+        title: latestMatch ? "Game from the most recent match" : null,
         tabindex: "0",
         onclick: () => {
           location.hash = detailHref;
@@ -1878,7 +1946,12 @@ const games = mount("games", (root, params, ctx) => {
     if (gameFilter.failed) parts.push("failed only");
     if (gameFilter.rated) parts.push("rated only");
     const shown = `${rows.length} shown`;
-    return parts.length ? `${shown} · ${parts.join(" · ")}` : `${shown} of ${fmt.int((state.counts && state.counts.games) || 0)}`;
+    const description = parts.length
+      ? `${shown} · ${parts.join(" · ")}`
+      : `${shown} of ${fmt.int((state.counts && state.counts.games) || 0)}`;
+    return rows.some((game) => isLatestMatchGame(game, latestMatchTag))
+      ? `${description} · latest match highlighted`
+      : description;
   }
 
   async function loadPairMatrix() {
@@ -1933,14 +2006,20 @@ const games = mount("games", (root, params, ctx) => {
     loadPairMatrix();
     const cacheable = isDefaultGameFilter(gameFilter);
     const cached = cacheable ? gamesFirstPageCache?.page ?? null : null;
-    const applyPage = (page) => {
+    const applyPage = (page, requestRevision = latestMatchRunRevision) => {
       rows = page.games || [];
       next = page.next || null;
+      latestMatchTag = requestRevision !== latestMatchRunRevision
+        ? latestMatchLiveTag
+        : typeof page?.latest_match_tag === "string"
+        ? page.latest_match_tag
+        : "";
       cap = Math.max(STREAM_CAP, rows.length);
       renderAll();
     };
     if (cached) applyPage(cached);
     try {
+      const requestRevision = latestMatchRunRevision;
       const page = cacheable
         ? await requestGamesFirstPage({
             force:
@@ -1949,7 +2028,7 @@ const games = mount("games", (root, params, ctx) => {
           })
         : await api(gameQuery(gameFilter, null));
       if (!ctx.alive()) return;
-      if (!sameGamesPage(page, cached)) applyPage(page);
+      if (!sameGamesPage(page, cached)) applyPage(page, requestRevision);
     } catch (err) {
       if (!ctx.alive()) return;
       if (!cached) {
@@ -1980,6 +2059,13 @@ const games = mount("games", (root, params, ctx) => {
       ((game.a === gameFilter.bot && game.b === gameFilter.opponent) ||
         (game.a === gameFilter.opponent && game.b === gameFilter.bot))
     ) loadPairMatrix();
+  });
+
+  ctx.on("run_started", (payload) => {
+    const tag = startedMatchTag(payload);
+    if (!tag) return;
+    latestMatchTag = tag;
+    if (tbody.isConnected) renderAll();
   });
 });
 
@@ -2224,11 +2310,16 @@ function aggregateProfilerReports(reports) {
   });
 }
 
-function profilerGroup(group, game) {
-  const spans = [...group.spans.values()].sort(
-    (left, right) => right.self_us - left.self_us || right.total_us - left.total_us || left.name.localeCompare(right.name)
-  );
-  const scale = Math.max(1, ...spans.map((span) => span.total_us));
+function profilerGroup(group, game, spanMode) {
+  const spans = [...group.spans.values()]
+    .map((span) => ({ span, metric: profilerSpanMetric(span, spanMode) }))
+    .sort(
+      (left, right) =>
+        right.metric.inclusive_us - left.metric.inclusive_us ||
+        (right.metric.exclusive_us ?? 0) - (left.metric.exclusive_us ?? 0) ||
+        left.span.name.localeCompare(right.span.name)
+    );
+  const scale = Math.max(1, ...spans.map(({ metric }) => metric.inclusive_us));
   const typeSummary = [...group.types.entries()]
     .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
     .map(([name, count]) => `${name} ×${count}`)
@@ -2238,7 +2329,7 @@ function profilerGroup(group, game) {
   const warnings = group.interrupted + group.badNesting;
 
   const tbody = el("tbody");
-  for (const span of spans) {
+  for (const { span, metric } of spans) {
     const average = span.calls ? span.total_us / span.calls : 0;
     tbody.appendChild(
       el(
@@ -2251,8 +2342,13 @@ function profilerGroup(group, game) {
           el(
             "span",
             { class: "profile-bar", "aria-hidden": "true" },
-            el("span", { class: "profile-bar-total", style: { width: `${(span.total_us / scale) * 100}%` } }),
-            el("span", { class: "profile-bar-self", style: { width: `${(span.self_us / scale) * 100}%` } })
+            el("span", { class: "profile-bar-total", style: { width: `${(metric.inclusive_us / scale) * 100}%` } }),
+            metric.exclusive_us === null
+              ? null
+              : el("span", {
+                  class: "profile-bar-self",
+                  style: { width: `${(metric.exclusive_us / scale) * 100}%` },
+                })
           )
         ),
         el("td", { class: "num", text: profileTime(span.self_us) }),
@@ -2297,11 +2393,31 @@ function profilerGroup(group, game) {
             "tr",
             null,
             el("th", { scope: "col", text: "Span" }),
-            el("th", { scope: "col", class: "num", text: "Self" }),
-            el("th", { scope: "col", class: "num", text: "Total" }),
+            el("th", {
+              scope: "col",
+              class: "num",
+              text: "Self",
+              title: "Exclusive CPU time across all calls",
+            }),
+            el("th", {
+              scope: "col",
+              class: "num",
+              text: "Total",
+              title: "Inclusive CPU time across all calls",
+            }),
             el("th", { scope: "col", class: "num", text: "Calls" }),
-            el("th", { scope: "col", class: "num", text: "Avg" }),
-            el("th", { scope: "col", class: "num", text: "Max" })
+            el("th", {
+              scope: "col",
+              class: "num",
+              text: "Avg",
+              title: "Average inclusive CPU time per call",
+            }),
+            el("th", {
+              scope: "col",
+              class: "num",
+              text: "Max",
+              title: "Maximum inclusive CPU time for one call",
+            })
           )
         ),
         tbody
@@ -2310,17 +2426,22 @@ function profilerGroup(group, game) {
   );
 }
 
-function profilerView(reports, game) {
+function profilerView(reports, game, spanMode = "avg") {
   const groups = aggregateProfilerReports(reports);
+  const barNote = spanMode === "total"
+    ? "Bars show cumulative self (exclusive) time over cumulative total (inclusive) time."
+    : spanMode === "max"
+      ? "Bars show maximum inclusive time for one call; maximum self time is not recorded."
+      : "Bars show average self (exclusive) time over average total (inclusive) time per call.";
   return el(
     "div",
     { class: "profile-view" },
     el(
       "p",
       { class: "small mute profile-note" },
-      "CPU time from surviving units that emitted a final report. Bars show self time over total time; nested spans can overlap their parents."
+      `CPU time from surviving units that emitted a final report. ${barNote} Nested spans can overlap their parents.`
     ),
-    ...groups.map((group) => profilerGroup(group, game))
+    ...groups.map((group) => profilerGroup(group, game, spanMode))
   );
 }
 
@@ -2414,6 +2535,7 @@ const game = mount("game", (root, params, ctx) => {
   const theme = () => document.documentElement.dataset.theme || state.theme || "dark";
   const squareViewer = globalThis.oarena?.squareViewer;
   let replayProfilerReports = normaliseProfilerRecords(squareViewer?.getProfiler?.(String(id)));
+  let profilerSpanMode = "avg";
   let renderProfilerReports = () => {};
   const stopProfiler = squareViewer?.onProfiler?.(({ key, records }) => {
     if (String(key) !== String(id) || !ctx.alive()) return;
@@ -2476,9 +2598,17 @@ const game = mount("game", (root, params, ctx) => {
   fullscreen.hidden = true;
   const batchSelectorSlot = el("div", { class: "game-batch-selector-slot", hidden: true });
   const detailSlot = el("div", { class: "game-report-slot" }, skeletonRows(4));
+  let batchLinksExpanded = false;
+  const gameErrorMark = el("span", {
+    class: "badge game-error-mark",
+    "data-status": "bot_error",
+    text: "!",
+    role: "img",
+    hidden: true,
+  });
   const view = viewRoot(
     {
-      title: `Game #${Number.isFinite(id) ? id : "?"}`,
+      title: [`Game #${Number.isFinite(id) ? id : "?"}`, gameErrorMark],
       sub: "",
       full: true,
       crumbs: crumbs(el("a", { href: taggedGamesHref, text: "Games" }), el("span", { text: `#${id}` })),
@@ -2497,6 +2627,7 @@ const game = mount("game", (root, params, ctx) => {
   root.appendChild(view);
 
   let replayData = null;
+  let batchReplayRows = null;
   viewerSelect.addEventListener("change", (event) => {
     const requested = event.currentTarget.value;
     viewerChoice = requested === "official" && officialAvailable ? "official" : "2d";
@@ -2507,6 +2638,11 @@ const game = mount("game", (root, params, ctx) => {
       /* The choice still applies to this page when storage is unavailable. */
     }
     if (replayData && ctx.alive()) mountViz(replayData);
+    if (viewerChoice === "2d" && batchReplayRows) {
+      squareViewer?.prepareGames(batchReplayRows, id);
+    } else if (viewerChoice !== "2d") {
+      squareViewer?.prepareGames([], id);
+    }
   });
 
   async function loadBatchSelector(selected) {
@@ -2520,14 +2656,48 @@ const game = mount("game", (root, params, ctx) => {
         );
       const selectedRow = games.find((entry) => Number(entry.id) === id);
       if (!selectedRow || selectedRow.batch_ordinal !== selected.batch_ordinal) return;
+      batchReplayRows = games;
+      if (viewerChoice === "2d") squareViewer?.prepareGames(games, id);
 
-      const links = games.map((entry) => {
+      const score = batchScore(games);
+      const overall = batchOverallResult(score);
+      const resultCounts = [
+        score.draw ? `${score.draw} draw${score.draw === 1 ? "" : "s"}` : null,
+        score.errors ? `${score.errors} error${score.errors === 1 ? "" : "s"}` : null,
+      ].filter(Boolean);
+      const resultCountsLabel = resultCounts.length ? resultCounts.join(", ") : null;
+      const linkEntries = (() => {
+        if (!batchLinksExpanded && games.length > GAME_BATCH_PREVIEW_LIMIT) {
+          const keep = Math.max(1, GAME_BATCH_PREVIEW_LIMIT - 1);
+          const leading = games.slice(0, keep);
+          const includeSelected = !leading.some((entry) => Number(entry.id) === id);
+          if (includeSelected) {
+            return [...leading, selectedRow];
+          }
+          return leading;
+        }
+        return games;
+      })();
+      const links = linkEntries.map((entry) => {
         const active = Number(entry.id) === id;
-        const result = entry.status !== "ok"
+        const winnerName = entry.winner === "a" || entry.winner === "b"
+          ? fmt.winner(entry)
+          : null;
+        const resultKind = entry.status !== "ok"
+          ? "error"
+          : winnerName
+            ? "winner"
+            : "draw";
+        const result = resultKind === "error"
           ? "!"
-          : entry.winner === "draw" || !entry.winner
-            ? "D"
-            : String(entry.winner).toUpperCase();
+          : resultKind === "draw"
+            ? "Draw"
+            : winnerName;
+        const resultTitle = resultKind === "winner"
+          ? `${winnerName} won`
+          : resultKind === "draw"
+            ? "Draw"
+            : `Game ended with ${String(entry.status || "an error").replace(/_/g, " ")}`;
         const ordinal = entry.batch_ordinal + 1;
         return el(
           "a",
@@ -2536,13 +2706,22 @@ const game = mount("game", (root, params, ctx) => {
             href: taggedGameHref(entry.id),
             "aria-current": active ? "page" : null,
             "data-status": entry.status || "unknown",
-            title: `Game ${ordinal}: ${entry.a} vs ${entry.b} on ${entry.map}`,
+            title: `Game ${ordinal}: ${entry.a} vs ${entry.b} on ${entry.map} · ${resultTitle}`,
           },
           el("span", { class: "game-batch-number num", text: String(ordinal) }),
           el("span", { class: "game-batch-map", text: entry.map || "unknown map" }),
-          el("span", { class: "game-batch-result", text: result }),
+          el("span", {
+            class: "game-batch-result",
+            "data-result": resultKind,
+            text: result,
+            title: resultTitle,
+          }),
         );
       });
+      // Name the sides of the score so the reader never has to guess which bot
+      // the left number belongs to -- the very confusion a slot tally created.
+      const scoreText = `${score.a}–${score.b}`;
+      const scoreTitle = batchScoreTitle(score);
       const fullList = page?.more
         ? el("a", {
             class: "game-batch-all",
@@ -2557,6 +2736,20 @@ const game = mount("game", (root, params, ctx) => {
       const gameCountLabel = page?.more
         ? `${games.length} of ${playedGames} games`
         : `${games.length} games`;
+      const toggle = games.length > GAME_BATCH_PREVIEW_LIMIT
+        ? el("button", {
+            class: "btn btn-xs btn-ghost game-batch-toggle",
+            type: "button",
+            "aria-pressed": batchLinksExpanded ? "true" : "false",
+            onclick: async () => {
+              batchLinksExpanded = !batchLinksExpanded;
+              await loadBatchSelector(selected);
+            },
+            text: batchLinksExpanded
+              ? `Show first ${GAME_BATCH_PREVIEW_LIMIT} games`
+              : `Show all ${games.length} games`,
+          })
+        : null;
       const linksRail = el("div", { class: "game-batch-links" }, links);
       fill(
         batchSelectorSlot,
@@ -2568,7 +2761,13 @@ const game = mount("game", (root, params, ctx) => {
             { class: "game-batch-label" },
             "Match ",
             el("span", { class: "num", text: gameCountLabel }),
+            " · ",
+            el("span", { class: "game-batch-score", text: scoreText, title: scoreTitle }),
+            " · ",
+            el("span", { class: "mute", text: overall }),
+            resultCountsLabel ? el("span", { class: "mute", text: ` (${resultCountsLabel})` }) : null,
           ),
+          toggle,
           linksRail,
           fullList,
         ),
@@ -2658,6 +2857,19 @@ const game = mount("game", (root, params, ctx) => {
     if (!ctx.alive()) return;
 
     view.setSub(`${data.a} vs ${data.b} · ${data.map}`);
+    if (gameHasError(data)) {
+      const errors = (Number(data.a_errors) || 0) + (Number(data.b_errors) || 0);
+      const status = data.status !== "ok"
+        ? STATUS_LABEL[data.status] || conditionLabel(data.status)
+        : "";
+      const label = [
+        status ? `Game ended with ${status}` : "",
+        errors ? `${fmt.int(errors)} attributed bot ${errors === 1 ? "error" : "errors"}` : "",
+      ].filter(Boolean).join("; ") || "Game error";
+      gameErrorMark.title = label;
+      gameErrorMark.setAttribute("aria-label", label);
+      gameErrorMark.hidden = false;
+    }
     replayData = data;
     mountViz(data);
     if (
@@ -2706,6 +2918,39 @@ const game = mount("game", (root, params, ctx) => {
       el("div", { class: "logview-empty", text: "Loading…" })
     );
     const profilerBody = el("div", { class: "game-profiler-body" });
+    const profilerModeButtons = new Map();
+    const profilerModeTitles = {
+      avg: "Scale and sort spans by average inclusive time per call",
+      total: "Scale and sort spans by cumulative inclusive time",
+      max: "Scale and sort spans by maximum inclusive time for one call",
+    };
+    const profilerModeControl = el(
+      "span",
+      {
+        class: "seg",
+        role: "group",
+        "aria-label": "Profiler span bar metric",
+      },
+      PROFILER_SPAN_MODES.map((mode) => {
+        const button = el("button", {
+          class: "seg-btn",
+          type: "button",
+          text: mode === "avg" ? "Avg" : mode === "total" ? "Total" : "Max",
+          title: profilerModeTitles[mode],
+          "aria-pressed": mode === profilerSpanMode ? "true" : "false",
+          onclick: () => {
+            if (mode === profilerSpanMode) return;
+            profilerSpanMode = mode;
+            for (const [candidate, candidateButton] of profilerModeButtons) {
+              candidateButton.setAttribute("aria-pressed", candidate === mode ? "true" : "false");
+            }
+            renderProfilerReports();
+          },
+        });
+        profilerModeButtons.set(mode, button);
+        return button;
+      })
+    );
     const profilerSection = el(
       "section",
       {
@@ -2717,6 +2962,7 @@ const game = mount("game", (root, params, ctx) => {
         "div",
         { class: "game-report-head" },
         el("h2", { class: "game-report-title", id: profilerTitle, text: "Profiler" }),
+        profilerModeControl,
         el("span", { class: "chip", text: "CPU µs", title: "Controller CPU clock, measured in microseconds" })
       ),
       profilerBody
@@ -2808,7 +3054,7 @@ const game = mount("game", (root, params, ctx) => {
     renderProfilerReports = () => {
       const reports = replayProfilerReports.length ? replayProfilerReports : logProfilerReports;
       profilerSection.hidden = reports.length === 0;
-      fill(profilerBody, reports.length ? profilerView(reports, data) : null);
+      fill(profilerBody, reports.length ? profilerView(reports, data, profilerSpanMode) : null);
     };
     const renderCapturedOutput = (text) => {
       const captured = extractProfilerReports(text);
@@ -3007,7 +3253,7 @@ const bots = mount("bots", (root, params, ctx) => {
         emptyState({
           title: "No bots yet",
           hint: [
-            "Every sub-directory of ",
+            "Every directory below ",
             code((state.config && state.config.bots_dir) || "bots/"),
             " that holds a ",
             code("main.py"),
@@ -3572,8 +3818,13 @@ const maps = mount("maps", (root, params, ctx) => {
 const PLATFORM_RECENT_LIMIT = 20;
 const PLATFORM_CACHE_TTL = 15_000;
 const PLATFORM_LADDER_TTL = 60_000;
+const PLATFORM_RELATIVE_TIME_REFRESH_MS = 15_000;
+const PLATFORM_VERSION_SYNC_POLL_MS = 1_000;
+const PLATFORM_VERSION_SYNC_MAX_POLLS = 30;
+const PLATFORM_VERSION_SYNC_SLOW_POLL_MS = 5_000;
+const PLATFORM_VERSION_SYNC_ERROR_RETRY_MS = 10_000;
 const platformResponseCache = new Map();
-const platformRecentUi = { mode: "all", teamId: "", teamName: "" };
+const platformRecentUi = { mode: "all", teamId: "", teamName: "", outcome: "all" };
 
 function cachedPlatformApi(key, path, ttl) {
   const now = Date.now();
@@ -3624,6 +3875,104 @@ function platformMatchTimestamp(match) {
   return match?.completed_at || match?.created_at || null;
 }
 
+function platformRelativeTime(timestamp) {
+  const value = typeof timestamp === "string" ? timestamp : "";
+  return el("time", {
+    "data-platform-relative-time": "",
+    datetime: value,
+    title: value,
+    text: fmt.ago(value),
+  });
+}
+
+function platformBotVersionSnapshot(row) {
+  const version = Number.isSafeInteger(row?.bot_version) ? row.bot_version : null;
+  const firstSeenAt = typeof row?.version_first_seen_at === "string"
+    && Number.isFinite(Date.parse(row.version_first_seen_at))
+    ? row.version_first_seen_at
+    : "";
+  if (version === null || !firstSeenAt) return null;
+  const history = (Array.isArray(row?.version_history) ? row.version_history : [])
+    .map((entry) => {
+      const entryVersion = Number.isSafeInteger(entry?.version) ? entry.version : null;
+      const entryFirstSeenAt = typeof entry?.first_seen_at === "string"
+        && Number.isFinite(Date.parse(entry.first_seen_at))
+        ? entry.first_seen_at
+        : "";
+      if (entryVersion === null || !entryFirstSeenAt) return null;
+      return {
+        version: entryVersion,
+        firstSeenAt: entryFirstSeenAt,
+        transitionKnown: entry?.transition_known === true,
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 3);
+  return {
+    version,
+    firstSeenAt,
+    transitionKnown: row?.version_transition_known === true,
+    history,
+  };
+}
+
+function platformBotVersionLabel(snapshot) {
+  if (!snapshot) return "–";
+  const age = fmt.ago(snapshot.firstSeenAt);
+  return snapshot.transitionKnown
+    ? `v${snapshot.version} · ≈${age}`
+    : `v${snapshot.version} · seen ${age}`;
+}
+
+function platformBotVersionTooltip(snapshot) {
+  if (!snapshot) return "Bot version history is not available.";
+  const lines = [
+    `v${snapshot.version} became the observed active version by ${fmt.ago(snapshot.firstSeenAt)}.`,
+    "This can be a new upload or an older version being reactivated; the upload may be earlier.",
+  ];
+  if (!snapshot.transitionKnown) {
+    lines.push("This is a baseline observation; its version transition was not observed.");
+  }
+  if (snapshot.history.length) {
+    lines.push("", "Recent active-version observations:");
+    for (const entry of snapshot.history) {
+      const qualifier = entry.transitionKnown ? "version switch observed" : "baseline; switch unknown";
+      lines.push(`v${entry.version} — ${fmt.ago(entry.firstSeenAt)} (${qualifier})`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function refreshPlatformBotVersionTime(node) {
+  let snapshot = null;
+  try {
+    snapshot = JSON.parse(node.dataset.botVersionSnapshot || "null");
+  } catch {
+    // A malformed data attribute should degrade to the unknown marker.
+  }
+  node.textContent = platformBotVersionLabel(snapshot);
+  node.title = platformBotVersionTooltip(snapshot);
+}
+
+function platformBotVersionTime(row) {
+  const snapshot = platformBotVersionSnapshot(row);
+  if (!snapshot) {
+    return el("span", {
+      class: "fcode-bot-version mute",
+      text: "–",
+      title: "Bot version history is not available.",
+    });
+  }
+  const node = el("time", {
+    class: "fcode-bot-version",
+    "data-platform-version-time": "",
+    datetime: snapshot.firstSeenAt,
+    dataset: { botVersionSnapshot: JSON.stringify(snapshot) },
+  });
+  refreshPlatformBotVersionTime(node);
+  return node;
+}
+
 function platformMatchScore(match) {
   const left = Number.isFinite(match?.score_a) ? String(match.score_a) : "–";
   const right = Number.isFinite(match?.score_b) ? String(match.score_b) : "–";
@@ -3643,6 +3992,7 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
   platformRecentUi.mode = officialTests
     ? "tests"
     : (platformRecentUi.mode === "tests" ? "all" : platformRecentUi.mode);
+  if (officialTests) platformRecentUi.outcome = "all";
 
   let session = null;
   let recentRows = [];
@@ -3655,6 +4005,27 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
   let autoSelectRecent = false;
   let matchPollTimer = null;
   let recentPollTimer = null;
+  let versionSyncTimer = null;
+  let versionSyncPolls = 0;
+  let versionHistoryData = null;
+  let selectedVersionTeamId = "";
+  let selectedVersionTeamName = "";
+  let versionTeamSelectionExplicit = false;
+  let selectedVersionRequest = 0;
+  let selectedVersionLoading = false;
+  let selectedVersionError = null;
+  let ladderRankByTeamId = new Map();
+  // Expansion survives the timeline's periodic re-render, and each run's games
+  // are fetched once. Keys carry the team so switching teams cannot show one
+  // team's games under another's run.
+  const expandedRuns = new Set();
+  const runGamesCache = new Map();
+  const runGamesPending = new Set();
+  let scrolledPlayingKey = "";
+  // What each team actually played in the open match, read from oarena's own
+  // records because the platform's match detail does not carry versions.
+  let matchRuns = null;
+  let matchRunsFor = "";
 
   const officialLink = el("a", {
     class: "btn btn-sm btn-ghost",
@@ -3707,7 +4078,7 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
     el(
       "label",
       { class: "field fcode-match-id" },
-      el("span", { class: "field-label", text: "Match ID or visualiser URL" }),
+      el("span", { class: "field-label", text: "Open a match by ID or visualiser URL" }),
       matchInput,
     ),
     el(
@@ -3725,8 +4096,8 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
   fill(
     vizSlot,
     emptyState({
-      title: officialTests ? "Finding a recent official test…" : "Finding a recent FCode match…",
-      hint: ["You can also paste a match ID above."],
+      title: officialTests ? "Looking for a recent test…" : "Looking for a recent match…",
+      hint: ["Or paste a match ID below."],
     }),
   );
   const matchBar = el("section", {
@@ -3737,23 +4108,70 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
   const recentSlot = el("div", { class: "fcode-panel-body" }, skeletonRows(7));
   const recentFilterSlot = el("div", { class: "fcode-recent-filters" });
   const ladderSlot = el("div", { class: "fcode-panel-body" }, skeletonRows(7));
+  const versionHistorySlot = el("div", { class: "fcode-version-history" }, skeletonRows(4));
+  const versionTeamSelect = el("select", {
+    class: "select select-compact fcode-version-team-select",
+    "aria-label": "Team bot-version history",
+    disabled: true,
+    onchange: (event) => {
+      const teamId = event.currentTarget.value;
+      const team = (versionHistoryData?.teams || []).find((candidate) => candidate.team_id === teamId);
+      selectVersionHistoryTeam(
+        { id: teamId, name: team?.team_name || teamId },
+        { explicit: true },
+      );
+    },
+  });
+  // Jumping between the two teams of the open match is the common move; the
+  // full dropdown stays for every other team on the ladder.
+  const versionQuickSwitch = el("div", {
+    class: "seg fcode-version-quick",
+    role: "group",
+    "aria-label": "Teams in the open match",
+    hidden: true,
+  });
+  const versionHistoryActions = el(
+    "div",
+    { class: "fcode-version-actions" },
+    versionQuickSwitch,
+    versionTeamSelect,
+  );
+  const versionHistoryFoot = el(
+    "span",
+    {
+      text: "Built from the ladder and unrated matches oarena has seen, so each time is a first sighting rather than an upload. A version that comes back later appears again. Click a version to list its games.",
+    },
+  );
 
   const view = viewRoot(
     {
       title: officialTests ? "Test runs" : "FCode",
-      sub: officialTests ? "official FCode tests" : "official matches",
+      sub: officialTests ? "your team's official test games" : "matches on the official server",
       toolbar: [officialLink, replayLink, fullscreenButton],
     },
-    el("div", { class: "panel fcode-match-loader" }, matchForm, sessionSlot),
     vizSlot,
     matchBar,
+    el("div", { class: "panel fcode-match-loader" }, matchForm, sessionSlot),
     el(
       "div",
       { class: `fcode-browse-grid${officialTests ? " is-single" : ""}` },
-      card(
-        { title: officialTests ? "Official test runs" : "Recent matches", actions: recentFilterSlot, flush: true },
-        recentSlot,
-      ),
+      officialTests
+        ? card(
+            { title: "Official test runs", actions: recentFilterSlot, flush: true },
+            recentSlot,
+          )
+        : el(
+            "div",
+            { class: "fcode-side-stack" },
+            card(
+              { title: "Recent matches", actions: recentFilterSlot, flush: true },
+              recentSlot,
+            ),
+            card(
+              { title: "Bot versions", actions: versionHistoryActions, foot: versionHistoryFoot },
+              versionHistorySlot,
+            ),
+          ),
       officialTests ? null : card({ title: "FCode ladder", flush: true }, ladderSlot),
     ),
   );
@@ -3791,24 +4209,15 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
     if (!team?.id) return;
     platformRecentUi.teamId = team.id;
     platformRecentUi.teamName = team.name || team.id;
+    selectVersionHistoryTeam(team, { explicit: true });
     if (platformRecentUi.mode === "mine") platformRecentUi.mode = "all";
     void loadRecent({ reset: true });
   }
 
-  function teamButton(team, match, side = null) {
-    const hasScore = Number.isFinite(match?.score_a) && Number.isFinite(match?.score_b);
-    const scoreWon = side === "a"
-      ? match?.score_a > match?.score_b
-      : side === "b" && match?.score_b > match?.score_a;
-    const scoreLost = side === "a"
-      ? match?.score_a < match?.score_b
-      : side === "b" && match?.score_b < match?.score_a;
-    const won = match?.winner_id
-      ? match.winner_id === team?.id
-      : Boolean(hasScore && scoreWon);
-    const lost = match?.winner_id
-      ? match.winner_id !== team?.id
-      : Boolean(hasScore && scoreLost);
+  function teamButton(team, match) {
+    const outcome = platformTeamOutcome(match, team?.id);
+    const won = outcome === "win";
+    const lost = outcome === "loss";
     const className = `fcode-team${won ? " is-winner" : lost ? " is-loser" : ""}`;
     if (!team?.id) {
       return el("span", {
@@ -3847,7 +4256,7 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
           { class: "fcode-auth fcode-auth-warn" },
           "Not signed in. Run ",
           code("fcode login"),
-          " to load your recent matches and replays; the public ladder remains available.",
+          " to see your own matches and replays. The public ladder works either way.",
         ),
       );
     } else {
@@ -3856,7 +4265,32 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
         el("span", { class: "fcode-auth" }, "Signed in as ", el("strong", { text: data.team?.name || "your FCode team" })),
       );
     }
-    renderRecentFilters();
+    if (!officialTests && !versionTeamSelectionExplicit && versionHistoryData) {
+      if (!ensureDefaultVersionTeam()) renderVersionHistory();
+    }
+    if (recentRows.length) renderRecent();
+    else renderRecentFilters();
+  }
+
+  function recentOutcomeTeam() {
+    if (officialTests || platformRecentUi.mode === "tests") return null;
+    if (platformRecentUi.mode === "mine") {
+      const team = session?.authenticated ? session.team : null;
+      return team?.id ? { id: team.id, name: team.name || team.id } : null;
+    }
+    return platformRecentUi.teamId
+      ? {
+          id: platformRecentUi.teamId,
+          name: platformRecentUi.teamName || platformRecentUi.teamId,
+        }
+      : null;
+  }
+
+  function visibleRecentRows() {
+    const team = recentOutcomeTeam();
+    const outcome = platformRecentUi.outcome;
+    if (!team || (outcome !== "win" && outcome !== "loss")) return recentRows;
+    return recentRows.filter((match) => platformTeamOutcome(match, team.id) === outcome);
   }
 
   function renderRecentFilters() {
@@ -3879,6 +4313,9 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
           if (value === "mine" || value === "tests") {
             platformRecentUi.teamId = "";
             platformRecentUi.teamName = "";
+          }
+          if (value === "tests" || (value !== "mine" && !platformRecentUi.teamId)) {
+            platformRecentUi.outcome = "all";
           }
           if (value === "tests" && !officialTests) {
             location.hash = "#/test-runs";
@@ -3905,18 +4342,60 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
             onclick: () => {
               platformRecentUi.teamId = "";
               platformRecentUi.teamName = "";
+              platformRecentUi.outcome = "all";
               void loadRecent({ reset: true });
             },
           }),
         )
       : null;
-    const refresh = officialTests
-      ? btn("Refresh", {
-          class: "btn btn-xs btn-ghost",
-          onclick: () => void loadRecent({ reset: true, quiet: true }),
-        })
+    const outcomeTeam = recentOutcomeTeam();
+    const outcomeFilter = outcomeTeam
+      ? el(
+          "span",
+          {
+            class: "seg",
+            role: "group",
+            "aria-label": `Result for ${outcomeTeam.name}`,
+          },
+          [
+            ["all", "All results"],
+            ["win", "Wins"],
+            ["loss", "Losses"],
+          ].map(([value, label]) =>
+            el("button", {
+              class: "seg-btn",
+              type: "button",
+              text: label,
+              "aria-pressed": platformRecentUi.outcome === value ? "true" : "false",
+              onclick: () => {
+                platformRecentUi.outcome = value;
+                renderRecent();
+              },
+            }),
+          ),
+        )
       : null;
-    fill(recentFilterSlot, el("span", { class: "seg" }, filterButtons), teamChip, refresh);
+    const refresh = btn("Refresh", {
+      class: "btn btn-xs btn-ghost",
+      title: officialTests ? "Refresh official test runs" : "Refresh recent FCode matches",
+      onclick: async (event) => {
+        const button = event.currentTarget;
+        button.disabled = true;
+        refreshRecentTimestamps();
+        try {
+          await loadRecent({ reset: true, quiet: true, force: true });
+        } finally {
+          if (ctx.alive() && button.isConnected) button.disabled = false;
+        }
+      },
+    });
+    fill(
+      recentFilterSlot,
+      el("span", { class: "seg" }, filterButtons),
+      teamChip,
+      outcomeFilter,
+      refresh,
+    );
   }
 
   function recentPath(cursor = null) {
@@ -3953,8 +4432,9 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
       );
       return;
     }
+    const visibleRows = visibleRecentRows();
     const tbody = el("tbody");
-    for (const match of recentRows) {
+    for (const match of visibleRows) {
       const teams = platformMatchTeams(match);
       const openLabel = `Open ${teams.a.name || "Team A"} versus ${teams.b.name || "Team B"}`;
       const openMatch = () => {
@@ -3982,7 +4462,7 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
                 if (event.key === "Enter") openMatch();
               },
             },
-            el("td", { class: "col-time", text: fmt.ago(platformMatchTimestamp(match)), title: platformMatchTimestamp(match) || "" }),
+            el("td", { class: "col-time" }, platformRelativeTime(platformMatchTimestamp(match))),
             el(
               "td",
               null,
@@ -3995,14 +4475,21 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
               ),
             ),
             el("td", { class: "num strong", text: platformMatchScore(match) }),
+            // Status, the stage it reached and why it stopped are one story.
             el(
               "td",
-              null,
+              { class: "fcode-test-state" },
               el("span", { class: "badge", text: status }),
-              stage ? el("span", { class: "small mute", text: ` ${stage}` }) : null,
+              stage ? el("span", { class: "small mute", text: stage }) : null,
+              match.error
+                ? el("span", {
+                    class: `fcode-test-error ${match.error ? "err" : "mute"}`,
+                    text: match.error,
+                    title: match.error,
+                  })
+                : null,
             ),
             el("td", { text: match.requested_by_name || "–" }),
-            el("td", { class: `fcode-test-error ${match.error ? "err" : "mute"}`, text: match.error || "–", title: match.error || "" }),
             el(
               "td",
               { class: "col-action" },
@@ -4022,11 +4509,11 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
       const row = el(
         "tr",
         { class: "fcode-match-row", "data-match-id": match.id },
-        el("td", { class: "col-time", text: fmt.ago(platformMatchTimestamp(match)), title: platformMatchTimestamp(match) || "" }),
+        el("td", { class: "col-time" }, platformRelativeTime(platformMatchTimestamp(match))),
         el(
           "td",
           null,
-          el("span", { class: "fcode-matchup" }, teamButton(teams.a, match, "a"), el("span", { class: "vs", text: "vs" }), teamButton(teams.b, match, "b")),
+          el("span", { class: "fcode-matchup" }, teamButton(teams.a, match), el("span", { class: "vs", text: "vs" }), teamButton(teams.b, match)),
         ),
         el("td", { class: "num strong", text: platformMatchScore(match) }),
         el("td", null, el("span", { class: "badge", text: platformMatchLabel(match) })),
@@ -4045,6 +4532,22 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
       );
       tbody.appendChild(row);
     }
+    if (!visibleRows.length) {
+      const outcome = platformRecentUi.outcome === "win" ? "wins" : "losses";
+      tbody.appendChild(
+        el(
+          "tr",
+          null,
+          el("td", {
+            class: "center mute",
+            colspan: showingTests ? "6" : "5",
+            text: `No ${outcome} in ${fmt.int(recentRows.length)} loaded matches${
+              recentCursor ? "; load more to search older matches" : ""
+            }.`,
+          }),
+        ),
+      );
+    }
     const table = el(
       "table",
       { class: `table table-compact fcode-recent-table${showingTests ? " table-clickable" : ""}` },
@@ -4058,9 +4561,8 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
               el("th", { text: "When" }),
               el("th", { text: "Bots" }),
               el("th", { class: "num", text: "Score" }),
-              el("th", { text: "Status / stage" }),
-              el("th", { text: "Requested by" }),
-              el("th", { text: "Error" }),
+              el("th", { text: "Status" }),
+              el("th", { text: "Started by" }),
               el("th", { text: "" }),
             )
           : el("tr", null, el("th", { text: "When" }), el("th", { text: "Teams" }), el("th", { class: "num", text: "Score" }), el("th", { text: "Type" }), el("th", { text: "" })),
@@ -4082,11 +4584,24 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
     fill(recentSlot, tableWrap(table), more);
   }
 
+  function refreshRecentTimestamps() {
+    for (const node of recentSlot.querySelectorAll("time[data-platform-relative-time]")) {
+      node.textContent = fmt.ago(node.getAttribute("datetime") || "");
+    }
+    for (const node of versionHistorySlot.querySelectorAll("time[data-platform-relative-time]")) {
+      node.textContent = fmt.ago(node.getAttribute("datetime") || "");
+    }
+    for (const node of ladderSlot.querySelectorAll("time[data-platform-version-time]")) {
+      refreshPlatformBotVersionTime(node);
+    }
+  }
+
   function maybeSelectRecentMatch() {
     if (!autoSelectRecent || userSelected || activeDetail || !ctx.alive()) return;
+    const candidates = visibleRecentRows();
     const first = platformRecentUi.mode === "tests"
-      ? recentRows.find((match) => match?.id)
-      : recentRows.find((match) => match?.status === "complete" && match?.id);
+      ? candidates.find((match) => match?.id)
+      : candidates.find((match) => match?.status === "complete" && match?.id);
     if (first) {
       autoSelectRecent = false;
       void selectMatch({ matchId: first.id, game: 1 });
@@ -4096,11 +4611,11 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
     fill(
       vizSlot,
       emptyState({
-        title: "No FCode match selected",
+        title: "Nothing to play yet",
         hint: [
           session?.authenticated === false
-            ? "Sign in with fcode login, or paste a match ID above."
-            : "Paste a match ID above, or wait for a completed recent match.",
+            ? "Run fcode login, or paste a match ID below."
+            : "Paste a match ID below, or wait for a match to finish.",
         ],
       }),
     );
@@ -4121,7 +4636,7 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
     }, 5_000);
   }
 
-  async function loadRecent({ reset, quiet = false }) {
+  async function loadRecent({ reset, quiet = false, force = false }) {
     const request = ++recentRequest;
     const cursor = reset ? null : recentCursor;
     if (recentPollTimer !== null) {
@@ -4137,10 +4652,12 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
       }
     }
     const path = recentPath(cursor);
+    const cacheKey = `recent:${path}`;
+    if (force && !officialTests && !cursor) platformResponseCache.delete(cacheKey);
     try {
       const response = officialTests || cursor
         ? await api(path)
-        : await cachedPlatformApi(`recent:${path}`, path, PLATFORM_CACHE_TTL);
+        : await cachedPlatformApi(cacheKey, path, PLATFORM_CACHE_TTL);
       if (!ctx.alive() || request !== recentRequest) return null;
       const rows = officialTests
         ? (Array.isArray(response?.test_runs) ? response.test_runs : [])
@@ -4157,6 +4674,12 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
     } catch (err) {
       if (!ctx.alive() || request !== recentRequest) return null;
       if (quiet && recentRows.length) {
+        if (force) {
+          toast(
+            `Could not refresh ${officialTests ? "official test runs" : "recent matches"}: ${errorMessage(err)}`,
+            "error",
+          );
+        }
         scheduleRecentPoll();
         return null;
       }
@@ -4181,6 +4704,12 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
 
   function renderLadder(data) {
     const rankings = Array.isArray(data?.rankings) ? data.rankings : [];
+    ladderRankByTeamId = new Map(
+      rankings
+        .filter((row) => row?.team_id && Number.isSafeInteger(row.rank))
+        .map((row) => [row.team_id, row.rank]),
+    );
+    if (versionHistoryData) renderVersionHistory();
     if (!rankings.length) {
       fill(ladderSlot, emptyState({ title: "FCode ladder is empty" }));
       return;
@@ -4203,6 +4732,7 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
               onclick: () => pickTeam({ id: row.team_id, name: row.team_name }),
             }),
           ),
+          el("td", null, platformBotVersionTime(row)),
           el("td", { class: "num", text: fmt.num(row.rating, 0) }),
           el("td", { class: "num mute", text: fmt.int(row.matches_played) }),
         ),
@@ -4210,32 +4740,663 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
     }
     const table = el(
       "table",
-      { class: "table table-compact" },
-      el("thead", null, el("tr", null, el("th", { class: "num", text: "#" }), el("th", { text: "Team" }), el("th", { class: "num", text: "Rating" }), el("th", { class: "num", text: "Matches" }))),
+      { class: "table table-compact fcode-ladder-table" },
+      el("thead", null, el("tr", null, el("th", { class: "num", text: "#" }), el("th", { text: "Team" }), el("th", { text: "Bot" }), el("th", { class: "num", text: "Rating" }), el("th", { class: "num", text: "Matches" }))),
       tbody,
       Number(data?.total) > rankings.length
         ? el("caption", { text: `Top ${rankings.length} of ${fmt.int(data.total)} teams` })
         : null,
     );
-    fill(ladderSlot, tableWrap(table));
+    const trackingError = typeof data?.version_tracking?.last_error === "string"
+      ? data.version_tracking.last_error
+      : "";
+    fill(
+      ladderSlot,
+      trackingError
+        ? el("div", {
+            class: "fcode-version-status err",
+            text: "Could not refresh bot versions. Showing what was saved earlier.",
+            title: trackingError,
+          })
+        : null,
+      tableWrap(table),
+    );
   }
 
-  async function loadLadder() {
+  function selectVersionHistoryTeam(team, { explicit = false } = {}) {
+    if (!team?.id || officialTests) return;
+    selectedVersionTeamId = String(team.id);
+    selectedVersionTeamName = team.name || selectedVersionTeamId;
+    if (explicit) versionTeamSelectionExplicit = true;
+    selectedVersionRequest += 1;
+    selectedVersionLoading = false;
+    selectedVersionError = null;
+    if (versionHistoryData) {
+      renderVersionHistory();
+      const known = (versionHistoryData.teams || []).some(
+        (candidate) => candidate.team_id === selectedVersionTeamId,
+      );
+      if (!known) void loadSelectedVersionHistory(selectedVersionTeamId);
+    }
+  }
+
+  async function loadSelectedVersionHistory(teamId) {
+    const request = ++selectedVersionRequest;
+    selectedVersionLoading = true;
+    selectedVersionError = null;
+    renderVersionHistory();
+    try {
+      const key = `version-history-team:${teamId}`;
+      const data = await cachedPlatformApi(
+        key,
+        `/api/platform/version-history?team_id=${encodeURIComponent(teamId)}&limit=1`,
+        PLATFORM_LADDER_TTL,
+      );
+      if (!ctx.alive() || request !== selectedVersionRequest || teamId !== selectedVersionTeamId) return;
+      const selected = Array.isArray(data?.teams) ? data.teams[0] : null;
+      if (selected) {
+        const teams = Array.isArray(versionHistoryData?.teams)
+          ? versionHistoryData.teams.filter((candidate) => candidate.team_id !== selected.team_id)
+          : [];
+        versionHistoryData = { ...(versionHistoryData || {}), teams: [selected, ...teams] };
+      }
+    } catch (err) {
+      if (ctx.alive() && request === selectedVersionRequest && teamId === selectedVersionTeamId) {
+        selectedVersionError = err;
+      }
+    } finally {
+      if (ctx.alive() && request === selectedVersionRequest && teamId === selectedVersionTeamId) {
+        selectedVersionLoading = false;
+        renderVersionHistory();
+      }
+    }
+  }
+
+  function preferredVersionTeam() {
+    const signedTeam = session?.authenticated && session.team?.id ? session.team : null;
+    const match = activeDetail?.match;
+    if (match) {
+      const teams = platformMatchTeams(match);
+      const sides = ["a", "b"]
+        .map((side) => teams[side])
+        .filter((team) => team?.id);
+      // Your own team stays selected whenever it is one of the two playing;
+      // otherwise the panel follows the match, which is the only way the
+      // highlight can show anything for a match between other teams.
+      const own = sides.find(
+        (team) => signedTeam && String(team.id) === String(signedTeam.id),
+      );
+      const chosen = own || sides[0];
+      if (chosen) return { id: String(chosen.id), name: chosen.name || String(chosen.id) };
+    }
+    return signedTeam
+      ? { id: String(signedTeam.id), name: signedTeam.name || String(signedTeam.id) }
+      : null;
+  }
+
+  function ensureDefaultVersionTeam() {
+    if (officialTests || versionTeamSelectionExplicit || !versionHistoryData) return false;
+    const preferred = preferredVersionTeam();
+    if (!preferred) return false;
+    const known = (versionHistoryData.teams || []).some(
+      (candidate) => candidate.team_id === preferred.id,
+    );
+    const changed = selectedVersionTeamId !== preferred.id;
+    selectedVersionTeamId = preferred.id;
+    selectedVersionTeamName = preferred.name;
+    if (known) return false;
+    if (!selectedVersionLoading || changed) void loadSelectedVersionHistory(preferred.id);
+    return true;
+  }
+
+  function renderVersionHistory() {
+    const rawTeams = Array.isArray(versionHistoryData?.teams) ? versionHistoryData.teams : [];
+    const teams = rawTeams
+      .map((candidate, index) => ({ candidate, index }))
+      .sort((left, right) => {
+        const leftRank = ladderRankByTeamId.get(left.candidate.team_id) ?? Infinity;
+        const rightRank = ladderRankByTeamId.get(right.candidate.team_id) ?? Infinity;
+        if (leftRank !== rightRank) return leftRank < rightRank ? -1 : 1;
+        return left.index - right.index;
+      })
+      .map(({ candidate }) => candidate);
+    const preferredTeamId = preferredVersionTeam()?.id || "";
+    let team = teams.find((candidate) => candidate.team_id === selectedVersionTeamId) || null;
+    if (!versionTeamSelectionExplicit) {
+      const preferred = teams.find((candidate) => candidate.team_id === preferredTeamId) || null;
+      const awaitingPreferred = Boolean(
+        preferredTeamId
+        && selectedVersionTeamId === preferredTeamId
+        && (selectedVersionLoading || selectedVersionError),
+      );
+      team = preferred || (awaitingPreferred ? null : (teams[0] || team || null));
+      if (team) {
+        selectedVersionTeamId = team.team_id;
+        selectedVersionTeamName = team.team_name || team.team_id;
+      }
+    }
+
+    const options = [];
+    if (selectedVersionTeamId && !teams.some((candidate) => candidate.team_id === selectedVersionTeamId)) {
+      options.push(el("option", {
+        value: selectedVersionTeamId,
+        text: selectedVersionTeamName || selectedVersionTeamId,
+      }));
+    }
+    for (const candidate of teams) {
+      const rank = ladderRankByTeamId.get(candidate.team_id);
+      const version = Number.isSafeInteger(candidate?.current_version)
+        ? ` · v${candidate.current_version}`
+        : "";
+      options.push(el("option", {
+        value: candidate.team_id,
+        text: `${Number.isSafeInteger(rank) ? `#${rank} · ` : ""}${candidate.team_name || candidate.team_id}${version}`,
+      }));
+    }
+    fill(versionTeamSelect, options);
+    versionTeamSelect.disabled = !options.length;
+    if (selectedVersionTeamId) versionTeamSelect.value = selectedVersionTeamId;
+
+    if (!team && selectedVersionLoading) {
+      fill(versionHistorySlot, skeletonRows(3));
+      return;
+    }
+    if (!team && selectedVersionError) {
+      fill(
+        versionHistorySlot,
+        platformErrorState(
+          `Could not load bot-version history for ${selectedVersionTeamName || "this team"}`,
+          selectedVersionError,
+          [btn("Retry", { onclick: () => void loadSelectedVersionHistory(selectedVersionTeamId) })],
+        ),
+      );
+      return;
+    }
+    if (!teams.length) {
+      fill(
+        versionHistorySlot,
+        emptyState({
+          title: "No versions seen yet",
+          hint: ["Entries appear once this team has played ladder matches."],
+        }),
+      );
+      return;
+    }
+    if (!team) {
+      fill(
+        versionHistorySlot,
+        emptyState({
+          title: `No saved version history for ${selectedVersionTeamName || "this team"}`,
+        }),
+      );
+      return;
+    }
+
+    const runs = Array.isArray(team.runs) ? team.runs : [];
+    if (!runs.length) {
+      fill(versionHistorySlot, emptyState({ title: "No saved version periods for this team" }));
+      return;
+    }
+    const playingOrdinal = playedRunOrdinal(team);
+    const timeline = el("div", { class: "timeline fcode-version-timeline" });
+    for (const [index, run] of runs.entries()) {
+      const firstSeenAt = typeof run?.first_seen_at === "string" ? run.first_seen_at : "";
+      const lastSeenAt = typeof run?.last_seen_at === "string" ? run.last_seen_at : "";
+      const firstSeen = platformRelativeTime(firstSeenAt);
+      firstSeen.classList.add("timeline-ts", "num");
+      const isCurrent = index === 0;
+      const ordinal = Number.isSafeInteger(run?.ordinal) ? run.ordinal : null;
+      const isPlaying = ordinal !== null && ordinal === playingOrdinal;
+      const key = ordinal === null ? "" : runKey(team.team_id, ordinal);
+      const expanded = Boolean(key) && expandedRuns.has(key);
+      const toggle = el(
+        "button",
+        {
+          class: "fcode-version-run-head",
+          type: "button",
+          disabled: ordinal === null,
+          "aria-expanded": expanded ? "true" : "false",
+          title: ordinal === null
+            ? ""
+            : expanded
+              ? "Hide the games played on this version"
+              : "Show the games played on this version",
+          onclick: () => {
+            if (!key) return;
+            if (expandedRuns.has(key)) expandedRuns.delete(key);
+            else {
+              expandedRuns.add(key);
+              void loadRunGames(team.team_id, ordinal);
+            }
+            renderVersionHistory();
+          },
+        },
+        el("span", { class: "fcode-run-caret", "aria-hidden": "true", text: expanded ? "▾" : "▸" }),
+        el("strong", {
+          class: "num",
+          text: Number.isSafeInteger(run?.version) ? `v${run.version}` : "unknown version",
+        }),
+        isCurrent ? el("span", { class: "badge", text: "latest observed" }) : null,
+        isPlaying
+          ? el("span", {
+              class: "badge fcode-version-playing",
+              text: "this match",
+              title: "The version this team played in the match open above",
+            })
+          : null,
+      );
+      timeline.appendChild(
+        el(
+          "div",
+          {
+            class: "timeline-item",
+            "data-current": isCurrent ? "true" : null,
+            "data-playing": isPlaying ? "true" : null,
+          },
+          firstSeen,
+          el(
+            "div",
+            { class: "timeline-body" },
+            toggle,
+            el("div", {
+              class: "small",
+              text: run?.transition_known === true
+                ? "Version change observed"
+                : "Baseline observation",
+            }),
+            lastSeenAt && lastSeenAt !== firstSeenAt
+              ? el(
+                  "div",
+                  { class: "tiny mute" },
+                  "Last seen ",
+                  platformRelativeTime(lastSeenAt),
+                )
+              : null,
+            expanded ? runGamesNode(team.team_id, ordinal) : null,
+          ),
+        ),
+      );
+    }
+    const refreshWarning = selectedVersionError
+      ? el(
+          "div",
+          { class: "fcode-version-status err" },
+          el("span", { text: "Could not refresh this timeline. Showing what was saved earlier." }),
+          btn("Retry", {
+            class: "btn btn-xs btn-ghost",
+            onclick: () => void loadSelectedVersionHistory(selectedVersionTeamId),
+          }),
+        )
+      : null;
+    fill(versionHistorySlot, refreshWarning, timeline);
+    renderVersionQuickSwitch();
+    // Bring the highlighted run into view when it changes -- switching team, or
+    // opening a different match -- but not on every background refresh.
+    const playingKey = playingOrdinal === null
+      ? ""
+      : runKey(team.team_id, playingOrdinal);
+    if (playingKey && playingKey !== scrolledPlayingKey) {
+      scrolledPlayingKey = playingKey;
+      requestAnimationFrame(() => {
+        if (!ctx.alive()) return;
+        timeline
+          .querySelector('[data-playing="true"]')
+          ?.scrollIntoView({ block: "nearest" });
+      });
+    } else if (!playingKey) {
+      scrolledPlayingKey = "";
+    }
+  }
+
+  function matchRunFor(teamId) {
+    const teams = Array.isArray(matchRuns?.teams) ? matchRuns.teams : [];
+    return teams.find((row) => String(row?.team_id || "") === String(teamId)) || null;
+  }
+
+  async function loadMatchRuns(matchId) {
+    const wanted = String(matchId || "").toLowerCase();
+    if (!wanted || officialTests || matchRunsFor === wanted) return;
+    matchRunsFor = wanted;
+    matchRuns = null;
+    try {
+      const data = await api(
+        `/api/platform/version-history/match?match_id=${encodeURIComponent(wanted)}`,
+      );
+      if (!ctx.alive() || matchRunsFor !== wanted) return;
+      matchRuns = data && typeof data === "object" ? data : null;
+    } catch {
+      if (ctx.alive() && matchRunsFor === wanted) matchRuns = null;
+    } finally {
+      if (ctx.alive() && matchRunsFor === wanted) syncVersionPanelToMatch();
+    }
+  }
+
+  function renderVersionQuickSwitch() {
+    const match = activeDetail?.match;
+    if (officialTests || !match) {
+      fill(versionQuickSwitch);
+      versionQuickSwitch.hidden = true;
+      return;
+    }
+    const teams = platformMatchTeams(match);
+    const buttons = ["a", "b"]
+      .map((side) => {
+        const team = teams[side];
+        const id = team?.id ? String(team.id) : "";
+        if (!id) return null;
+        const name = team.name || id;
+        const recorded = matchRunFor(id);
+        const version = Number.isSafeInteger(recorded?.version)
+          ? recorded.version
+          : Number.isSafeInteger(team?.version)
+            ? team.version
+            : null;
+        return el(
+          "button",
+          {
+            class: "seg-btn fcode-version-quick-btn",
+            type: "button",
+            "aria-pressed": id === selectedVersionTeamId ? "true" : "false",
+            title: `Show ${name}'s bot versions`,
+            onclick: () => selectVersionHistoryTeam({ id, name }, { explicit: true }),
+          },
+          el("span", { class: "fcode-version-quick-name", text: name }),
+          version !== null ? el("span", { class: "tiny num", text: `v${version}` }) : null,
+        );
+      })
+      .filter(Boolean);
+    fill(versionQuickSwitch, buttons);
+    versionQuickSwitch.hidden = !buttons.length;
+  }
+
+  function playedRunOrdinal(team) {
+    const match = activeDetail?.match;
+    if (officialTests || !match || !team) return null;
+    const teams = platformMatchTeams(match);
+    const side = ["a", "b"].find(
+      (candidate) => String(teams[candidate]?.id || "") === String(team.team_id),
+    );
+    if (!side) return null;
+    // The recorded run is exact: it comes from this match's own observation,
+    // located by position in the team's series rather than by timestamp.
+    const recorded = matchRunFor(team.team_id);
+    if (Number.isSafeInteger(recorded?.ordinal)) return recorded.ordinal;
+    // Nothing recorded -- a pinned side, or a match older than the collected
+    // window. Fall back to whatever the match itself claims.
+    return resolvePlayedRunOrdinal({
+      runs: team.runs,
+      version: Number.isSafeInteger(recorded?.version)
+        ? recorded.version
+        : teams[side]?.version,
+      // Observations are keyed on when a match was created, so containment has
+      // to be tested against the same instant.
+      at: match.created_at || match.completed_at,
+    });
+  }
+
+  function runKey(teamId, ordinal) {
+    return `${teamId}:${ordinal}`;
+  }
+
+  async function loadRunGames(teamId, ordinal) {
+    const key = runKey(teamId, ordinal);
+    if (runGamesCache.has(key) || runGamesPending.has(key)) return;
+    runGamesPending.add(key);
+    try {
+      const query = new URLSearchParams({
+        team_id: teamId,
+        ordinal: String(ordinal),
+      });
+      const data = await api(`/api/platform/version-history/games?${query.toString()}`);
+      if (!ctx.alive()) return;
+      runGamesCache.set(key, data && typeof data === "object" ? data : null);
+    } catch (err) {
+      if (ctx.alive()) runGamesCache.set(key, { error: errorMessage(err) });
+    } finally {
+      runGamesPending.delete(key);
+      if (ctx.alive()) renderVersionHistory();
+    }
+  }
+
+  function runGamesNode(teamId, ordinal) {
+    const key = runKey(teamId, ordinal);
+    const data = runGamesCache.get(key);
+    if (!data) {
+      return el("div", { class: "fcode-run-games" }, skeletonRows(2));
+    }
+    if (data.error) {
+      return el("div", { class: "fcode-run-games err small", text: data.error });
+    }
+    const games = Array.isArray(data.games) ? data.games : [];
+    if (!games.length) {
+      return el("div", {
+        class: "fcode-run-games small mute",
+        text: "No games recorded for this version.",
+      });
+    }
+    const record = data.record || {};
+    const rows = games.map((game) => {
+      const score = Number.isFinite(game?.score_for) && Number.isFinite(game?.score_against)
+        ? `${game.score_for}–${game.score_against}`
+        : "–";
+      const opponent = game?.opponent_name || "unknown team";
+      const opponentVersion = Number.isSafeInteger(game?.opponent_version)
+        ? `v${game.opponent_version}`
+        : "";
+      const matchId = typeof game?.match_id === "string" ? game.match_id : "";
+      const when = platformRelativeTime(game?.match_at);
+      when.classList.add("num");
+      return el(
+        "a",
+        {
+          class: "fcode-run-game",
+          "data-result": game?.result || "pending",
+          href: matchId ? platformViewHash(matchId, 1) : null,
+          title: matchId ? `Open ${opponent} on the FCode viewer` : "",
+        },
+        when,
+        el("span", {
+          class: "badge fcode-run-kind",
+          text: game?.match_type === "unrated" ? "unrated" : "ladder",
+        }),
+        el("span", { class: "fcode-run-opponent", text: opponent }),
+        el("span", { class: "tiny mute num", text: opponentVersion }),
+        el("span", { class: "fcode-run-score num", text: score }),
+        el("span", {
+          class: "fcode-run-result",
+          // "unknown" is a match recorded before outcomes were tracked; a blank
+          // result is one that genuinely has not finished.
+          text: game?.result === "unknown"
+            ? "no result"
+            : game?.result || "in progress",
+          title: game?.result === "unknown"
+            ? "This match was recorded before oarena tracked outcomes."
+            : "",
+        }),
+      );
+    });
+    return el(
+      "div",
+      { class: "fcode-run-games" },
+      el(
+        "div",
+        { class: "fcode-run-summary small" },
+        wldSpan(record.wins || 0, record.losses || 0, record.draws || 0),
+        el("span", {
+          class: "mute",
+          text: `${fmt.int(data.total)} game${data.total === 1 ? "" : "s"}`
+            + (record.undecided ? ` · ${fmt.int(record.undecided)} unfinished` : "")
+            + (record.unknown ? ` · ${fmt.int(record.unknown)} without a result` : "")
+            + (data.truncated ? ` · showing ${fmt.int(games.length)}` : ""),
+        }),
+      ),
+      el("div", { class: "fcode-run-game-list" }, rows),
+    );
+  }
+
+  function armVersionSync(delay, callback) {
+    if (versionSyncTimer !== null) {
+      clearTimeout(versionSyncTimer);
+      versionSyncTimer = null;
+    }
+    if (!Number.isFinite(delay)) return;
+    versionSyncTimer = setTimeout(() => {
+      versionSyncTimer = null;
+      if (ctx.alive()) callback();
+    }, Math.max(1_000, delay));
+  }
+
+  function invalidateVersionHistoryCache() {
+    platformResponseCache.delete("version-history:100");
+    if (selectedVersionTeamId) {
+      platformResponseCache.delete(`version-history-team:${selectedVersionTeamId}`);
+    }
+  }
+
+  function scheduleVersionSync(tracking) {
+    if (tracking?.refreshing) {
+      const delay = versionSyncPolls < PLATFORM_VERSION_SYNC_MAX_POLLS
+        ? PLATFORM_VERSION_SYNC_POLL_MS
+        : PLATFORM_VERSION_SYNC_SLOW_POLL_MS;
+      versionSyncPolls += 1;
+      armVersionSync(delay, () => void pollVersionSync());
+    } else {
+      versionSyncPolls = 0;
+      const next = Date.parse(String(tracking?.next_refresh_at || ""));
+      if (Number.isFinite(next)) {
+        armVersionSync(next - Date.now() + 100, () => {
+          platformResponseCache.delete("ladder:100");
+          invalidateVersionHistoryCache();
+          void loadLadder({ trackingPoll: true });
+          void loadVersionHistory({ trackingPoll: true });
+        });
+      } else if (tracking?.last_error || tracking?.error) {
+        armVersionSync(PLATFORM_VERSION_SYNC_ERROR_RETRY_MS, () => {
+          platformResponseCache.delete("ladder:100");
+          invalidateVersionHistoryCache();
+          void loadLadder({ trackingPoll: true });
+          void loadVersionHistory({ trackingPoll: true });
+        });
+      }
+    }
+  }
+
+  async function pollVersionSync() {
+    try {
+      const tracking = await api("/api/platform/version-tracking");
+      if (!ctx.alive()) return;
+      if (tracking?.refreshing) {
+        scheduleVersionSync(tracking);
+        return;
+      }
+      platformResponseCache.delete("ladder:100");
+      invalidateVersionHistoryCache();
+      void loadLadder({ trackingPoll: true });
+      void loadVersionHistory({ trackingPoll: true });
+    } catch {
+      if (ctx.alive()) {
+        armVersionSync(PLATFORM_VERSION_SYNC_ERROR_RETRY_MS, () => void pollVersionSync());
+      }
+    }
+  }
+
+  async function loadLadder({ trackingPoll = false } = {}) {
     try {
       const data = await cachedPlatformApi(
         "ladder:100",
         "/api/platform/ladder?limit=100",
         PLATFORM_LADDER_TTL,
       );
-      if (ctx.alive()) renderLadder(data);
-    } catch (err) {
       if (ctx.alive()) {
+        renderLadder(data);
+        scheduleVersionSync(data?.version_tracking);
+      }
+    } catch (err) {
+      if (ctx.alive() && !trackingPoll) {
         fill(
           ladderSlot,
           platformErrorState("Could not load the FCode ladder", err, [btn("Retry", { onclick: loadLadder })]),
         );
+      } else if (ctx.alive()) {
+        armVersionSync(PLATFORM_VERSION_SYNC_ERROR_RETRY_MS, () => void pollVersionSync());
       }
     }
+  }
+
+  async function loadVersionHistory({ trackingPoll = false } = {}) {
+    try {
+      const data = await cachedPlatformApi(
+        "version-history:100",
+        "/api/platform/version-history?limit=100",
+        PLATFORM_LADDER_TTL,
+      );
+      if (ctx.alive()) {
+        const freshTeams = Array.isArray(data?.teams) ? data.teams : [];
+        const selectedMissingFromFresh = Boolean(
+          selectedVersionTeamId
+          && !freshTeams.some((candidate) => candidate.team_id === selectedVersionTeamId),
+        );
+        if (!selectedMissingFromFresh) {
+          selectedVersionRequest += 1;
+          selectedVersionLoading = false;
+          selectedVersionError = null;
+        }
+        const previousSelected = (versionHistoryData?.teams || []).find(
+          (candidate) => candidate.team_id === selectedVersionTeamId,
+        );
+        versionHistoryData = data || {};
+        if (
+          previousSelected
+          && !(versionHistoryData.teams || []).some(
+            (candidate) => candidate.team_id === previousSelected.team_id,
+          )
+        ) {
+          versionHistoryData = {
+            ...versionHistoryData,
+            teams: [previousSelected, ...(versionHistoryData.teams || [])],
+          };
+        }
+        const loadingSignedTeam = ensureDefaultVersionTeam();
+        if (!loadingSignedTeam) renderVersionHistory();
+        const selectedIsSignedIn = Boolean(
+          preferredVersionTeam()?.id
+          && preferredVersionTeam().id === selectedVersionTeamId,
+        );
+        if (
+          !loadingSignedTeam
+          && selectedVersionTeamId
+          && selectedMissingFromFresh
+          && (versionTeamSelectionExplicit || selectedIsSignedIn)
+        ) {
+          void loadSelectedVersionHistory(selectedVersionTeamId);
+        }
+      }
+    } catch (err) {
+      if (ctx.alive() && !trackingPoll) {
+        fill(
+          versionHistorySlot,
+          platformErrorState(
+            "Could not load bot-version history",
+            err,
+            [btn("Retry", { onclick: loadVersionHistory })],
+          ),
+        );
+      }
+    }
+  }
+
+  function syncVersionPanelToMatch() {
+    // The open match decides both the quick-switch buttons and which run is
+    // highlighted, so a new selection has to repaint the panel.
+    if (officialTests) return;
+    void loadMatchRuns(activeDetail?.match?.id);
+    if (!versionHistoryData) {
+      renderVersionQuickSwitch();
+      return;
+    }
+    // A different match can change which team the panel should be showing, so
+    // the default is re-resolved before repainting.
+    if (!ensureDefaultVersionTeam()) renderVersionHistory();
   }
 
   function renderMatchBar() {
@@ -4243,6 +5404,7 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
     const match = detail?.match;
     if (!match || !activeGame) {
       matchBar.hidden = true;
+      syncVersionPanelToMatch();
       return;
     }
     const teams = platformMatchTeams(match);
@@ -4250,6 +5412,7 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
     const gameButtons = [];
     for (let number = 1; number <= 5; number += 1) {
       const game = games.get(number);
+      const winnerName = platformGameWinnerName(game, match);
       gameButtons.push(
         el(
           "button",
@@ -4268,8 +5431,12 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
             },
           },
           el("span", { class: "fcode-game-label", text: `Game ${number}` }),
-          game?.winner_side
-            ? el("span", { class: `fcode-game-result side-${String(game.winner_side).toLowerCase()}`, text: String(game.winner_side).toUpperCase() })
+          winnerName
+            ? el("span", {
+                class: "fcode-game-result",
+                text: winnerName,
+                title: `${winnerName} won`,
+              })
             : null,
         ),
       );
@@ -4279,19 +5446,20 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
       el(
         "div",
         { class: "fcode-score" },
-        teamButton(teams.a, match, "a"),
+        teamButton(teams.a, match),
         el("strong", { class: "fcode-score-value num", text: platformMatchScore(match) }),
-        teamButton(teams.b, match, "b"),
+        teamButton(teams.b, match),
         el("span", { class: "badge", text: platformMatchLabel(match) }),
       ),
       el("div", { class: "fcode-game-tabs", role: "group", "aria-label": "Games in this match" }, gameButtons),
       el(
         "p",
         { class: "fcode-provenance" },
-        `Rendered with installed FCode${state.fcode ? ` ${state.fcode}` : ""} constants; remote replays do not include a recorded engine-metadata snapshot.`,
+        `Drawn with your installed FCode${state.fcode ? ` ${state.fcode}` : ""} constants, because remote replays do not include a recorded engine-metadata snapshot.`,
       ),
     );
     matchBar.hidden = false;
+    syncVersionPanelToMatch();
   }
 
   function showGame(game) {
@@ -4528,8 +5696,8 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
       fill(
         vizSlot,
         emptyState({
-          title: "Invalid FCode match link",
-          hint: [errorMessage(err), "Paste a match UUID or official visualiser URL above."],
+          title: "That match link did not parse",
+          hint: [errorMessage(err), "Paste a match UUID or an official visualiser URL."],
         }),
       );
     }
@@ -4543,6 +5711,7 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
   }
 
   renderRecentFilters();
+  ctx.timer(refreshRecentTimestamps, PLATFORM_RELATIVE_TIME_REFRESH_MS);
   const sessionPromise = cachedPlatformApi(
     "session",
     "/api/platform/session",
@@ -4558,6 +5727,7 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
     });
   const recentPromise = loadRecent({ reset: true });
   if (!officialTests) void loadLadder();
+  if (!officialTests) void loadVersionHistory();
   void sessionPromise;
 
   void (async () => {
@@ -4577,6 +5747,7 @@ function mountPlatformView(root, params, ctx, { officialTests = false } = {}) {
   ctx.add(() => {
     if (matchPollTimer !== null) clearTimeout(matchPollTimer);
     if (recentPollTimer !== null) clearTimeout(recentPollTimer);
+    if (versionSyncTimer !== null) clearTimeout(versionSyncTimer);
     squareViewer?.hide(vizSlot);
     fill(vizSlot);
   });
@@ -4592,12 +5763,1541 @@ const testRuns = mount("test-runs", (root, params, ctx) => {
 
 /* -------------------------------------------------------------------------- */
 
-/* 9. Storage                                                                  */
+/* 9. Official unrated scrims                                                  */
+/* -------------------------------------------------------------------------- */
+
+const SCRIM_POLL_MS = 8_000;
+const SCRIM_CLOCK_MS = 1_000;
+const SCRIM_TEAM_SEARCH_DELAY_MS = 450;
+const SCRIM_AUTO_TOP_K_DEFAULT = 10;
+const SCRIM_AUTO_TOP_K_MAX = 100;
+let scrimTeamPickerSequence = 0;
+let scrimInitialRefreshIssued = false;
+
+function scrimTimestamp(value) {
+  if (Number.isFinite(value)) {
+    const number = Number(value);
+    return number < 10_000_000_000 ? number * 1000 : number;
+  }
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function scrimErrorText(value) {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object") {
+    return String(value.message || value.error || value.detail || "");
+  }
+  return "";
+}
+
+function scrimFiniteNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function quotaWindowText(quota) {
+  const window = Number(quota?.window_s);
+  if (!Number.isFinite(window) || window <= 0) return "";
+  const span = window % 3600 === 0
+    ? `${window / 3600}h`
+    : window >= 60
+      ? `${Math.round(window / 60)} min`
+      : `${Math.round(window)}s`;
+  // Say when the number is a guess, so an unexpected pause is easy to explain.
+  return `requests per ${span}${quota?.learned ? "" : " (assumed)"}`;
+}
+
+function scrimCountdown(deadline, now = Date.now()) {
+  const at = scrimTimestamp(deadline);
+  if (at === null) return "";
+  const seconds = Math.max(0, Math.ceil((at - now) / 1000));
+  if (seconds <= 0) return "now";
+  if (seconds < 60) return `in ${seconds}s`;
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return `in ${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  return `in ${hours}h${remainder ? ` ${remainder}m` : ""}`;
+}
+
+const scrims = mount("scrims", (root, params, ctx) => {
+  void params;
+  let dashboard = null;
+  let selectedVersion = "current";
+  let dashboardRequest = 0;
+  let mapsRequest = 0;
+  let allowedMaps = [];
+  let mapPreviews = new Map(
+    (state.maps || []).map((map) => [String(map?.name || ""), map]),
+  );
+  let manualPending = false;
+  let manualRequestKey = null;
+  let manualRequestFingerprint = null;
+  let autoscrimPending = false;
+  let topTeamsRequest = 0;
+  let topTeamsPending = false;
+  let topSeedTeamsRequest = 0;
+  let topSeedTeamsPending = false;
+  let topTeamsSeed = [];
+  let topSeededFor = "";
+  let refreshPending = false;
+  let autoscrimDraftLoaded = false;
+  let autoscrimDirty = false;
+  const knownTeams = new Map();
+  const teamSearchCache = new Map();
+  const manualMaps = new Set();
+  const autoscrimMaps = new Set();
+  const autoscrimTargets = new Map();
+  const mapPreview = createMapPreview(root);
+  ctx.add(() => mapPreview.destroy());
+
+  const versionSelect = el("select", {
+    class: "select select-compact scrim-version-select",
+    "aria-label": "Bot version for scrim statistics",
+    onchange: (event) => {
+      selectedVersion = event.currentTarget.value || "current";
+      void loadDashboard({ quiet: false });
+    },
+  });
+  const refreshButton = btn("Refresh", {
+    class: "btn btn-sm btn-ghost",
+    title: "Refresh official unrated matches now",
+    onclick: () => void refreshOfficial({ reportError: true }),
+  });
+
+  const sessionSlot = el("div", { class: "scrim-session", "aria-live": "polite" });
+  const bannerSlot = el("div", { class: "scrim-banner-slot", "aria-live": "polite" });
+  const summarySlot = el("div", { class: "stats scrim-summary" }, skeletonRows(2));
+  const manualError = el("div", { class: "form-error", role: "alert", hidden: true });
+  const manualBlocked = el("div", { class: "field-hint scrim-blocked", "aria-live": "polite" });
+  const manualMapSlot = el("div", { class: "scrim-map-slot" });
+  const manualTopTeamsSlot = el("div", { class: "scrim-top-teams" });
+  const autoscrimMapSlot = el("div", { class: "scrim-map-slot" });
+  const autoscrimTopKInput = el("input", {
+    class: "input num scrim-topk",
+    type: "number",
+    min: "1",
+    max: String(SCRIM_AUTO_TOP_K_MAX),
+    step: "1",
+    value: String(SCRIM_AUTO_TOP_K_DEFAULT),
+    inputmode: "numeric",
+    "aria-label": "Top teams to add",
+  });
+  const autoscrimTopKButton = btn("Add top teams", { class: "btn" });
+  const autoscrimTopTeamsSlot = el("div", { class: "scrim-top-teams" });
+  const autoscrimTargetsSlot = el("div", { class: "scrim-targets" });
+  const autoscrimError = el("div", { class: "form-error", role: "alert", hidden: true });
+  const autoscrimStateSlot = el("div", { class: "scrim-status-line", "aria-live": "polite" });
+  const opponentStatsSlot = el("div", { class: "scrim-panel-body" }, skeletonRows(6));
+  const historySlot = el("div", { class: "scrim-panel-body" }, skeletonRows(8));
+
+  function rememberTeam(raw) {
+    const id = canonicalScrimUuid(raw?.id || raw?.team_id || raw?.teamId);
+    if (!id) return null;
+    const previous = knownTeams.get(id);
+    const name = String(raw?.name || raw?.team_name || raw?.teamName || previous?.name || "").trim();
+    const team = {
+      id,
+      name,
+      rating: Number.isFinite(raw?.rating) ? raw.rating : previous?.rating,
+      matches_played: Number.isFinite(raw?.matches_played)
+        ? raw.matches_played
+        : Number.isFinite(raw?.matchesPlayed)
+          ? raw.matchesPlayed
+          : previous?.matches_played,
+    };
+    knownTeams.set(id, team);
+    const target = autoscrimTargets.get(id);
+    if (target && name && !target.name) autoscrimTargets.set(id, { ...target, name });
+    return team;
+  }
+
+  function makeTeamPicker({ label, placeholder, onSelect }) {
+    const sequence = ++scrimTeamPickerSequence;
+    const listId = `scrim-team-options-${sequence}`;
+    let searchTimer = null;
+    let searchRequest = 0;
+    let selected = null;
+    let active = -1;
+    let options = [];
+    const list = el("div", {
+      class: "bot-combobox-list",
+      id: listId,
+      role: "listbox",
+      hidden: true,
+    });
+    const input = el("input", {
+      class: "input",
+      type: "text",
+      autocomplete: "off",
+      spellcheck: "false",
+      placeholder,
+      role: "combobox",
+      "aria-label": label,
+      "aria-autocomplete": "list",
+      "aria-controls": listId,
+      "aria-expanded": "false",
+    });
+
+    function close() {
+      list.hidden = true;
+      input.setAttribute("aria-expanded", "false");
+      input.removeAttribute("aria-activedescendant");
+      active = -1;
+    }
+
+    function choose(team) {
+      selected = rememberTeam(team);
+      if (!selected) return;
+      input.value = selected.name || selected.id;
+      close();
+      onSelect(selected);
+    }
+
+    function paint() {
+      fill(list);
+      if (!options.length) {
+        close();
+        return;
+      }
+      options.forEach((team, index) => {
+        const optionId = `${listId}-${index}`;
+        const option = el(
+          "div",
+          {
+            class: "bot-combobox-option",
+            id: optionId,
+            role: "option",
+            "aria-selected": index === active ? "true" : "false",
+            onmousedown: (event) => event.preventDefault(),
+            onclick: () => choose(team),
+          },
+          el("span", { class: "bot-combobox-name", text: team.name || team.id }),
+          el("span", {
+            class: "bot-combobox-tag num",
+            text: Number.isFinite(team.rating) ? fmt.num(team.rating, 0) : team.id.slice(0, 8),
+            title: team.id,
+          }),
+        );
+        list.appendChild(option);
+      });
+      list.hidden = false;
+      input.setAttribute("aria-expanded", "true");
+      if (active >= 0) input.setAttribute("aria-activedescendant", `${listId}-${active}`);
+    }
+
+    function useSearchResults(rawTeams) {
+      const ownId = canonicalScrimUuid(dashboard?.session?.team?.id);
+      options = (Array.isArray(rawTeams) ? rawTeams : [])
+        .map(rememberTeam)
+        .filter((team) => team && team.id !== ownId);
+      active = options.length ? 0 : -1;
+      paint();
+    }
+
+    async function search(query) {
+      const request = ++searchRequest;
+      const cacheKey = query.toLocaleLowerCase();
+      const cached = teamSearchCache.get(cacheKey);
+      if (cached) {
+        useSearchResults(cached);
+        return;
+      }
+      try {
+        const response = await api(`/api/platform/teams?q=${encodeURIComponent(query)}&limit=10`);
+        if (!ctx.alive() || request !== searchRequest) return;
+        const teams = Array.isArray(response?.teams) ? response.teams : [];
+        teamSearchCache.set(cacheKey, teams);
+        useSearchResults(teams);
+      } catch {
+        if (ctx.alive() && request === searchRequest) close();
+      }
+    }
+
+    input.addEventListener("input", () => {
+      // Invalidate an already in-flight query immediately; waiting for the
+      // next debounced request would let stale results repaint under new text.
+      searchRequest += 1;
+      close();
+      if (selected && input.value !== selected.name && input.value !== selected.id) selected = null;
+      if (searchTimer !== null) clearTimeout(searchTimer);
+      const query = input.value.trim();
+      if (query.length < 2 || canonicalScrimUuid(query)) {
+        close();
+        return;
+      }
+      searchTimer = setTimeout(() => {
+        searchTimer = null;
+        void search(query);
+      }, SCRIM_TEAM_SEARCH_DELAY_MS);
+    });
+    input.addEventListener("keydown", (event) => {
+      if (list.hidden || !options.length) return;
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        active = (active + direction + options.length) % options.length;
+        paint();
+      } else if (event.key === "Enter" && active >= 0) {
+        event.preventDefault();
+        choose(options[active]);
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        close();
+      }
+    });
+    input.addEventListener("blur", () => {
+      searchRequest += 1;
+      if (searchTimer !== null) clearTimeout(searchTimer);
+      searchTimer = null;
+      setTimeout(close, 100);
+    });
+    ctx.add(() => {
+      if (searchTimer !== null) clearTimeout(searchTimer);
+      searchRequest += 1;
+    });
+
+    return {
+      wrap: el("div", { class: "bot-combobox scrim-team-picker" }, input, list),
+      input,
+      value() {
+        if (selected) return selected;
+        const id = canonicalScrimUuid(input.value);
+        return id ? { id, name: knownTeams.get(id)?.name || "" } : null;
+      },
+      set(team) {
+        selected = rememberTeam(team);
+        input.value = selected?.name || selected?.id || "";
+      },
+      clear() {
+        selected = null;
+        input.value = "";
+        close();
+      },
+    };
+  }
+
+  let manualPicker;
+  let autoscrimPicker;
+  manualPicker = makeTeamPicker({
+    label: "Opponent team",
+    placeholder: "Search team name or paste UUID",
+    onSelect: () => showManualError(""),
+  });
+  autoscrimPicker = makeTeamPicker({
+    label: "Add autoscrim target",
+    placeholder: "Search and add a team",
+    onSelect: (team) => {
+      autoscrimTargets.set(team.id, team);
+      autoscrimDirty = true;
+      autoscrimPicker.clear();
+      renderAutoscrimTargets();
+    },
+  });
+
+  const sourceMatchInput = el("input", {
+    class: "input num",
+    type: "text",
+    autocomplete: "off",
+    spellcheck: "false",
+    placeholder: "Optional match UUID",
+    "aria-label": "Opponent source match UUID",
+  });
+  const manualSubmit = btn("Request scrim", { class: "btn btn-primary", type: "submit" });
+  const manualForm = el(
+    "form",
+    { class: "stack scrim-form" },
+    el(
+      "label",
+      { class: "field" },
+      el("span", { class: "field-label", text: "Opponent" }),
+      manualPicker.wrap,
+    ),
+    el(
+      "div",
+      { class: "field" },
+      el("span", { class: "field-label", text: "Ladder leaders" }),
+      manualTopTeamsSlot,
+      el("span", { class: "field-hint", text: "Click one to fill the opponent above." }),
+    ),
+    el(
+      "label",
+      { class: "field" },
+      el("span", { class: "field-label", text: "Pin their bot version" }),
+      sourceMatchInput,
+      el("span", {
+        class: "field-hint",
+        text: "Blank plays their latest bot. Paste an earlier match ID to replay the version from that match.",
+      }),
+    ),
+    el(
+      "div",
+      { class: "field" },
+      el("span", { class: "field-label", text: "Maps" }),
+      manualMapSlot,
+    ),
+    manualError,
+    el("div", { class: "row wrap scrim-submit-row" }, manualSubmit, manualBlocked),
+  );
+
+  const autoscrimEnabled = el("input", {
+    type: "checkbox",
+    "aria-label": "Enable autoscrim",
+  });
+  const autoscrimToggle = el(
+    "label",
+    { class: "toggle" },
+    autoscrimEnabled,
+    el("span", { class: "toggle-track" }, el("span", { class: "toggle-thumb" })),
+    el("span", { class: "toggle-label", text: "Enabled" }),
+  );
+  const saveAutoscrimButton = btn("Save autoscrim", { class: "btn btn-primary" });
+  const autoscrimForm = el(
+    "div",
+    { class: "stack scrim-form" },
+    el("div", { class: "row wrap" }, autoscrimToggle, autoscrimStateSlot),
+    el(
+      "div",
+      { class: "field" },
+      el("span", { class: "field-label", text: "Opponents" }),
+      autoscrimPicker.wrap,
+      autoscrimTargetsSlot,
+      el(
+        "div",
+        { class: "field-row" },
+        autoscrimTopKInput,
+        autoscrimTopKButton,
+      ),
+      el("span", {
+        class: "field-hint",
+        text: "Runs one match at a time, always picking the opponent you have played least. Your own team is skipped.",
+      }),
+    ),
+    el(
+      "div",
+      { class: "field" },
+      el("span", { class: "field-label", text: "Ladder leaders" }),
+      autoscrimTopTeamsSlot,
+      el("span", { class: "field-hint", text: "Click to add or remove." }),
+    ),
+    el(
+      "div",
+      { class: "field" },
+      el("span", { class: "field-label", text: "Maps" }),
+      autoscrimMapSlot,
+    ),
+    autoscrimError,
+    el("div", { class: "row wrap" }, saveAutoscrimButton),
+  );
+
+  const view = viewRoot(
+    {
+      title: "Scrims",
+      sub: "official unrated matches",
+      toolbar: [refreshButton],
+    },
+    sessionSlot,
+    bannerSlot,
+    summarySlot,
+    el(
+      "div",
+      { class: "grid grid-2 scrim-config-grid" },
+      card({ title: "Request scrim" }, manualForm),
+      card({ title: "Autoscrim" }, autoscrimForm),
+    ),
+    card({ title: "Results by opponent", actions: versionSelect, flush: true }, opponentStatsSlot),
+    card({ title: "Recent requests", flush: true }, historySlot),
+  );
+  root.appendChild(view);
+
+  function showManualError(message) {
+    manualError.textContent = message || "";
+    manualError.hidden = !message;
+  }
+
+  function showAutoscrimError(message) {
+    autoscrimError.textContent = message || "";
+    autoscrimError.hidden = !message;
+  }
+
+  function ownTeamId() {
+    return canonicalScrimUuid(dashboard?.session?.team?.id);
+  }
+
+  function parseTopK(raw) {
+    const parsed = Number.parseInt(String(raw || "").trim(), 10);
+    if (!Number.isFinite(parsed)) {
+      return null;
+    }
+    if (parsed <= 0) return null;
+    return Math.max(1, Math.min(SCRIM_AUTO_TOP_K_MAX, parsed));
+  }
+
+  function renderScrimTopTeamChips() {
+    if (!topTeamsSeed.length) {
+      const text = topSeedTeamsPending ? "Loading top teams…" : "No top teams available.";
+      fill(manualTopTeamsSlot, el("span", { class: "field-hint", text }));
+      fill(autoscrimTopTeamsSlot, el("span", { class: "field-hint", text }));
+      return;
+    }
+    const teams = topTeamsSeed.slice(0, SCRIM_AUTO_TOP_K_DEFAULT);
+    fill(
+      manualTopTeamsSlot,
+      el(
+        "div",
+        { class: "chip-set" },
+        teams.map((team) =>
+          el(
+            "button",
+            {
+              type: "button",
+              class: "chip chip-accent",
+              onclick: () => {
+                manualPicker.set(team);
+                showManualError("");
+              },
+            },
+            team.name || team.id,
+            team.rating !== undefined && Number.isFinite(team.rating)
+              ? el("span", { class: "chip-tag", text: fmt.num(team.rating, 0) })
+              : null,
+          ),
+        ),
+      ),
+    );
+    fill(
+      autoscrimTopTeamsSlot,
+      el(
+        "div",
+        { class: "chip-set" },
+        teams.map((team) => {
+          return el(
+            "button",
+            {
+              type: "button",
+              class: "chip chip-toggle chip-accent",
+              "aria-pressed": autoscrimTargets.has(team.id) ? "true" : "false",
+              onclick: () => {
+                if (autoscrimTargets.has(team.id)) {
+                  autoscrimTargets.delete(team.id);
+                } else {
+                  autoscrimTargets.set(team.id, team);
+                }
+                autoscrimDirty = true;
+                renderAutoscrimTargets();
+                renderScrimTopTeamChips();
+              },
+            },
+            team.name || team.id,
+          );
+        }),
+      ),
+    );
+  }
+
+  async function preloadTopSeedTeams() {
+    const owner = ownTeamId() || "anon";
+    const request = ++topSeedTeamsRequest;
+    if (topSeededFor === `${owner}:${SCRIM_AUTO_TOP_K_DEFAULT}` && topTeamsSeed.length > 0) return;
+    topSeededFor = `${owner}:${SCRIM_AUTO_TOP_K_DEFAULT}`;
+    topSeedTeamsPending = true;
+    renderScrimTopTeamChips();
+    try {
+      const ladder = await cachedPlatformApi(
+        `scrim-ladder-top:${SCRIM_AUTO_TOP_K_DEFAULT}`,
+        `/api/platform/ladder?${new URLSearchParams({ limit: String(SCRIM_AUTO_TOP_K_DEFAULT) }).toString()}`,
+        PLATFORM_LADDER_TTL,
+      );
+      if (!ctx.alive() || request !== topSeedTeamsRequest) return;
+      const rankings = Array.isArray(ladder?.rankings) ? ladder.rankings : [];
+      const own = owner !== "anon" ? owner : "";
+      const teams = [];
+      const seen = new Set();
+      for (const row of rankings) {
+        const team = rememberTeam({
+          id: row?.team_id,
+          name: row?.team_name || row?.team_id,
+          rating: row?.rating,
+          matches_played: row?.matches_played,
+        });
+        if (!team || team.id === own || seen.has(team.id)) continue;
+        seen.add(team.id);
+        teams.push(team);
+      }
+      topTeamsSeed = teams.slice(0, SCRIM_AUTO_TOP_K_DEFAULT);
+    } catch (error) {
+      if (ctx.alive() && request === topSeedTeamsRequest && !topTeamsSeed.length) {
+        topTeamsSeed = [];
+      }
+    } finally {
+      if (!ctx.alive() || request !== topSeedTeamsRequest) return;
+      topSeedTeamsPending = false;
+      renderScrimTopTeamChips();
+      renderAvailability();
+    }
+  }
+
+  async function addTopScrimTargets() {
+    if (topTeamsPending) return;
+    if (!dashboard) {
+      showAutoscrimError("Wait for scrim state to finish loading.");
+      return;
+    }
+    const limit = parseTopK(autoscrimTopKInput.value);
+    if (limit === null) {
+      showAutoscrimError("Top teams must be a positive number.");
+      return;
+    }
+    const request = ++topTeamsRequest;
+    topTeamsPending = true;
+    showAutoscrimError("");
+    autoscrimTopKButton.disabled = true;
+    autoscrimTopKButton.textContent = "Adding…";
+    const own = ownTeamId();
+    try {
+      const ladder = await cachedPlatformApi(
+        `scrim-ladder-top:${limit}`,
+        `/api/platform/ladder?${new URLSearchParams({ limit: String(limit) }).toString()}`,
+        PLATFORM_LADDER_TTL,
+      );
+      if (!ctx.alive() || request !== topTeamsRequest) return;
+      const rankings = Array.isArray(ladder?.rankings) ? ladder.rankings : [];
+      const added = new Set();
+      for (const row of rankings) {
+        const team = rememberTeam({
+          id: row?.team_id,
+          name: row?.team_name || row?.team_id,
+          rating: row?.rating,
+          matches_played: row?.matches_played,
+        });
+        if (!team) continue;
+        if (team.id === own) continue;
+        if (autoscrimTargets.has(team.id)) continue;
+        autoscrimTargets.set(team.id, team);
+        added.add(team.id);
+        autoscrimDirty = true;
+        if (added.size >= limit) break;
+      }
+      if (added.size === 0) {
+        showAutoscrimError(`No new teams available in top ${limit}.`);
+      }
+      renderAutoscrimTargets();
+      renderScrimTopTeamChips();
+    } catch (err) {
+      if (ctx.alive() && request === topTeamsRequest) {
+        showAutoscrimError(errorMessage(err));
+      }
+    } finally {
+      if (!ctx.alive() || request !== topTeamsRequest) return;
+      topTeamsPending = false;
+      autoscrimTopKButton.disabled = false;
+      autoscrimTopKButton.textContent = "Add top teams";
+      renderAvailability();
+    }
+  }
+
+  function displayTeam(team, fallbackId = "") {
+    const remembered = rememberTeam(team);
+    if (remembered) return remembered;
+    const id = canonicalScrimUuid(fallbackId);
+    return id ? knownTeams.get(id) || { id, name: "" } : { id: "", name: "Unknown team" };
+  }
+
+  function renderMapPicker(slot, selected, onChange) {
+    const available = [...new Set([
+      ...allowedMaps,
+      ...selected,
+    ])].sort((left, right) => left.localeCompare(right));
+    const label = selected.size
+      ? `${selected.size}/${SCRIM_MAP_MAX} selected · ${available.length} available`
+      : `Random from all ${available.length} maps`;
+    const clear = selected.size
+      ? btn("Random", {
+          class: "btn btn-xs btn-ghost",
+          title: "Clear map choices and let FCode choose random maps",
+          onclick: () => {
+            selected.clear();
+            onChange();
+            renderMapPickers();
+          },
+        })
+      : null;
+    if (!available.length) {
+      fill(
+        slot,
+        el("div", { class: "row wrap" }, el("span", { class: "field-hint", text: "Random maps (official map list unavailable)" })),
+      );
+      return;
+    }
+    const chips = available.map((name) => {
+      const map = mapPreviews.get(name) || { name };
+      const chip = el(
+        "button",
+        {
+          class: "chip chip-toggle",
+          type: "button",
+          "aria-pressed": selected.has(name) ? "true" : "false",
+          onclick: () => {
+            if (selected.has(name)) selected.delete(name);
+            else if (selected.size >= SCRIM_MAP_MAX) {
+              toast(`Choose at most ${SCRIM_MAP_MAX} maps`, "error");
+              return;
+            } else selected.add(name);
+            onChange();
+            renderMapPickers();
+          },
+        },
+        name,
+        map.width
+          ? [" ", el("span", { class: "chip-dim" }, `${map.width}×${map.height}`)]
+          : null,
+      );
+      mapPreview.bind(chip, map);
+      return chip;
+    });
+    fill(
+      slot,
+      el(
+        "div",
+        { class: "map-picker-head" },
+        el("span", { class: "field-hint", text: label }),
+        clear,
+      ),
+      el(
+        "div",
+        { class: "chip-set", role: "group", "aria-label": "Official FCode maps" },
+        chips,
+      ),
+    );
+  }
+
+  function renderMapPickers() {
+    mapPreview.hide();
+    renderMapPicker(manualMapSlot, manualMaps, () => {});
+    renderMapPicker(autoscrimMapSlot, autoscrimMaps, () => { autoscrimDirty = true; });
+  }
+
+  function renderAutoscrimTargets() {
+    if (!autoscrimTargets.size) {
+      fill(autoscrimTargetsSlot, el("span", { class: "field-hint", text: "No target teams yet." }));
+      return;
+    }
+    fill(
+      autoscrimTargetsSlot,
+      el(
+        "div",
+        { class: "chip-set", "aria-label": "Autoscrim target teams" },
+        [...autoscrimTargets.values()].map((team) =>
+          el(
+            "span",
+            { class: "chip chip-accent", title: team.id },
+            team.name || team.id.slice(0, 8),
+            el("button", {
+              class: "fcode-chip-clear",
+              type: "button",
+              text: "×",
+              "aria-label": `Remove ${team.name || team.id} from autoscrim targets`,
+              onclick: () => {
+                autoscrimTargets.delete(team.id);
+                autoscrimDirty = true;
+                renderAutoscrimTargets();
+              },
+            }),
+          ),
+        ),
+      ),
+    );
+  }
+
+  function deadlineNode(value, prefix = "retry") {
+    const at = scrimTimestamp(value);
+    return at === null
+      ? null
+      : el("time", {
+          class: "num",
+          datetime: new Date(at).toISOString(),
+          "data-scrim-deadline": String(at),
+          "data-scrim-prefix": prefix,
+          text: `${prefix} ${scrimCountdown(at)}`,
+        });
+  }
+
+  // One sentence per state, written so the tab answers "is it still scrimming?"
+  // at a glance. `tone` drives the colour; `action` is the one thing worth
+  // clicking from here.
+  function autoscrimStatus() {
+    const auto = dashboard?.autoscrim || {};
+    const state = String(auto.state || (auto.enabled ? "ready" : "off"));
+    const error = scrimErrorText(auto.last_error);
+    if (!dashboard) return { state, tone: "idle", label: "Loading…" };
+    if (dashboard.session?.authenticated !== true) {
+      return { state, tone: "warn", label: "Not signed in to FCode", detail: "Run fcode login on this machine." };
+    }
+    if (state === "paused") {
+      return {
+        state,
+        tone: "bad",
+        label: auto.blocked_reason || "Autoscrim is paused",
+        detail: error,
+        action: "resume",
+      };
+    }
+    if (!auto.enabled) {
+      return { state, tone: "idle", label: "Autoscrim is off", detail: "Add opponents and switch it on to scrim continuously." };
+    }
+    if (state === "backoff") {
+      return auto.rate_limited
+        ? {
+            state,
+            tone: "wait",
+            label: "Waiting for the shared FCode quota",
+            detail: error,
+            countdown: auto.backoff_until,
+            action: "pause",
+          }
+        : {
+            state,
+            tone: "warn",
+            label: "Retrying after a failed request",
+            detail: error,
+            countdown: auto.backoff_until,
+            action: "pause",
+          };
+    }
+    if (state === "submitting") return { state, tone: "good", label: "Sending a scrim request…", action: "pause" };
+    if (state === "waiting") {
+      return { state, tone: "good", label: "Scrim queued, waiting on FCode", countdown: auto.next_attempt_at, action: "pause" };
+    }
+    if (state === "coverage_complete") {
+      return { state, tone: "good", label: "Every opponent has been covered", action: "pause" };
+    }
+    return {
+      state,
+      tone: "good",
+      label: "Scrimming",
+      detail: error,
+      countdown: auto.next_attempt_at,
+      action: "pause",
+    };
+  }
+
+  function autoscrimStateText(auto) {
+    const stateName = String(auto?.state || (auto?.enabled ? "ready" : "off")).replace(/_/g, " ");
+    return stateName.charAt(0).toUpperCase() + stateName.slice(1);
+  }
+
+  function renderBanner() {
+    const status = autoscrimStatus();
+    const countdown = status.countdown ? deadlineNode(status.countdown, status.tone === "wait" ? "resumes" : "next") : null;
+    // A paused session is the one state the tab cannot recover from on its own,
+    // so it always carries the button that restarts it.
+    const action = status.action === "resume"
+      ? btn("Resume autoscrim", {
+          class: "btn btn-sm btn-primary",
+          disabled: autoscrimPending || !dashboard,
+          onclick: () => {
+            autoscrimEnabled.checked = true;
+            autoscrimDirty = true;
+            void saveAutoscrim({ restoreEnabled: false });
+          },
+        })
+      : status.action === "pause"
+        ? btn("Pause", {
+            class: "btn btn-sm btn-ghost",
+            disabled: autoscrimPending || !dashboard,
+            title: "Stop scheduling new autoscrim requests",
+            onclick: () => {
+              autoscrimEnabled.checked = false;
+              void saveAutoscrim({ restoreEnabled: true, disableOnly: true, preserveDraft: true });
+            },
+          })
+        : null;
+    fill(
+      bannerSlot,
+      el(
+        "div",
+        { class: "scrim-banner", "data-tone": status.tone },
+        el("span", { class: "scrim-banner-dot", "aria-hidden": "true" }),
+        el(
+          "div",
+          { class: "scrim-banner-text" },
+          el("strong", { text: status.label }),
+          status.detail ? el("span", { class: "scrim-banner-detail", text: status.detail }) : null,
+        ),
+        countdown,
+        action,
+      ),
+    );
+  }
+
+  function renderSummary() {
+    const session = dashboard?.session || {};
+    const own = session.team || {};
+    const submission = dashboard?.active_submission || null;
+    const auto = dashboard?.autoscrim || {};
+    const summary = dashboard?.summary || {};
+    const authenticated = session.authenticated === true;
+    fill(
+      sessionSlot,
+      authenticated
+        ? el(
+            "span",
+            { class: "fcode-auth" },
+            "Signed in as ",
+            el("strong", { text: own.name || "your FCode team" }),
+            submission?.version !== null && submission?.version !== undefined
+              ? ` · active v${submission.version}${submission.name ? ` (${submission.name})` : ""}`
+              : " · no active submission",
+          )
+        : el(
+            "span",
+            { class: "fcode-auth fcode-auth-warn" },
+            "Not signed in. Run ",
+            code("fcode login"),
+            " to request scrims.",
+          ),
+    );
+    view.setSub(
+      submission?.version !== null && submission?.version !== undefined
+        ? `active v${submission.version}`
+        : "official unrated matches",
+    );
+
+    const matchWins = scrimFiniteNumber(summary.match_wins ?? summary.wins);
+    const matchLosses = scrimFiniteNumber(summary.match_losses ?? summary.losses);
+    const matchDraws = scrimFiniteNumber(summary.match_draws ?? summary.draws);
+    const gamesWon = scrimFiniteNumber(summary.games_won ?? summary.game_wins);
+    const gamesLost = scrimFiniteNumber(summary.games_lost ?? summary.game_losses);
+    const gamesDrawn = scrimFiniteNumber(summary.games_drawn ?? summary.game_draws);
+    let winRate = scrimFiniteNumber(summary.win_rate);
+    if (winRate === null && gamesWon !== null && gamesLost !== null) {
+      const total = gamesWon + gamesLost + (gamesDrawn ?? 0);
+      winRate = total > 0 ? gamesWon / total : NaN;
+    }
+    // The banner already narrates autoscrim, so this row spends its space on the
+    // shared quota instead -- the number that actually explains a quiet period.
+    const quota = dashboard?.quota || {};
+    const quotaLimit = scrimFiniteNumber(quota.limit);
+    const quotaUsed = scrimFiniteNumber(quota.used);
+    fill(
+      summarySlot,
+      statTile(
+        "Active bot",
+        submission?.version !== null && submission?.version !== undefined ? `v${submission.version}` : "–",
+        submission?.name || submission?.status || "",
+      ),
+      statTile(
+        "FCode quota",
+        quotaLimit !== null ? `${quotaUsed ?? 0}/${quotaLimit}` : "–",
+        quotaWindowText(quota),
+      ),
+      statTile(
+        "Matches W-L-D",
+        matchWins !== null ? wldSpan(matchWins, matchLosses ?? 0, matchDraws ?? 0) : "–",
+      ),
+      statTile(
+        "Games W-L-D",
+        gamesWon !== null ? wldSpan(gamesWon, gamesLost ?? 0, gamesDrawn ?? 0) : "–",
+      ),
+      statTile("Game win rate", fmt.pct(winRate)),
+    );
+  }
+
+  function renderVersions() {
+    const activeVersion = dashboard?.active_submission?.version;
+    const parsedActiveVersion = scrimFiniteNumber(activeVersion);
+    const hasActiveVersion = Number.isInteger(parsedActiveVersion) && parsedActiveVersion > 0;
+    const versions = [];
+    const seen = new Set();
+    for (const raw of Array.isArray(dashboard?.versions) ? dashboard.versions : []) {
+      const version = Number(typeof raw === "object" ? raw?.version : raw);
+      if (!Number.isInteger(version) || version <= 0 || seen.has(version)) continue;
+      seen.add(version);
+      versions.push({ version, name: typeof raw === "object" ? String(raw?.name || "") : "" });
+    }
+    if (hasActiveVersion && !seen.has(parsedActiveVersion)) {
+      versions.push({ version: parsedActiveVersion, name: dashboard?.active_submission?.name || "" });
+    }
+    versions.sort((left, right) => right.version - left.version);
+    const options = [
+      el("option", {
+        value: "current",
+        text: hasActiveVersion ? `Current · v${parsedActiveVersion}` : "Current version",
+      }),
+      ...versions.map((row) =>
+        el("option", {
+          value: String(row.version),
+          text: `v${row.version}${row.name ? ` · ${row.name}` : ""}`,
+        }),
+      ),
+    ];
+    fill(versionSelect, options);
+    if ([...versionSelect.options].some((option) => option.value === selectedVersion)) {
+      versionSelect.value = selectedVersion;
+    } else {
+      selectedVersion = "current";
+      versionSelect.value = selectedVersion;
+    }
+  }
+
+  function renderOpponentStats() {
+    const rows = Array.isArray(dashboard?.by_opponent) ? dashboard.by_opponent : [];
+    if (!rows.length) {
+      fill(
+        opponentStatsSlot,
+        emptyState({
+          title: "No finished scrims for this bot version",
+          hint: ["Request one above, or add opponents and switch autoscrim on."],
+        }),
+      );
+      return;
+    }
+    const tbody = el("tbody");
+    for (const row of rows) {
+      const opponent = displayTeam(row.opponent, row.opponent_team_id);
+      const wins = Number(row.match_wins ?? row.wins) || 0;
+      const losses = Number(row.match_losses ?? row.losses) || 0;
+      const draws = Number(row.match_draws ?? row.draws) || 0;
+      const gamesWon = Number(row.games_won ?? row.game_wins) || 0;
+      const gamesLost = Number(row.games_lost ?? row.game_losses) || 0;
+      const gamesDrawn = Number(row.games_drawn ?? row.game_draws) || 0;
+      const opponentVersions = Array.isArray(row.opponent_versions)
+        ? row.opponent_versions
+        : row.opponent_version !== null && row.opponent_version !== undefined
+          ? [row.opponent_version]
+          : [];
+      let winRate = scrimFiniteNumber(row.win_rate);
+      const gameTotal = gamesWon + gamesLost + gamesDrawn;
+      if (winRate === null) winRate = gameTotal ? gamesWon / gameTotal : NaN;
+      tbody.appendChild(
+        el(
+          "tr",
+          null,
+          el("td", { title: opponent.id, text: opponent.name || opponent.id }),
+          el("td", {
+            class: "num mute",
+            text: opponentVersions.length ? opponentVersions.map((version) => `v${version}`).join(", ") : "–",
+          }),
+          el("td", { class: "num" }, wldSpan(wins, losses, draws)),
+          el("td", { class: "num" }, wldSpan(gamesWon, gamesLost, gamesDrawn)),
+          el("td", { class: "num strong", text: fmt.pct(winRate) }),
+          el("td", { class: "col-time" }, platformRelativeTime(row.last_played_at || row.completed_at)),
+        ),
+      );
+    }
+    fill(
+      opponentStatsSlot,
+      tableWrap(
+        el(
+          "table",
+          { class: "table table-compact scrim-opponent-table" },
+          el(
+            "thead",
+            null,
+            el(
+              "tr",
+              null,
+              el("th", { text: "Opponent" }),
+              el("th", { text: "Their bot" }),
+              el("th", { class: "num", text: "Matches W-L-D" }),
+              el("th", { class: "num", text: "Games W-L-D" }),
+              el("th", { class: "num", text: "Win rate" }),
+              el("th", { text: "Last" }),
+            ),
+          ),
+          tbody,
+        ),
+      ),
+    );
+  }
+
+  function requestOpponent(request) {
+    return displayTeam(
+      request?.opponent,
+      request?.opponent_team_id || request?.opponent?.id,
+    );
+  }
+
+  function requestVersions(request) {
+    const ours = request?.our_submission?.version ?? request?.our_version;
+    const theirs = request?.opponent_version;
+    const pinned = request?.source_match_id || request?.opponent_source_match_id;
+    return `${ours !== null && ours !== undefined ? `v${ours}` : "v?"} vs ${
+      theirs !== null && theirs !== undefined ? `v${theirs}` : pinned ? "pinned" : "latest"
+    }`;
+  }
+
+  function renderHistory() {
+    const requests = Array.isArray(dashboard?.requests) ? dashboard.requests : [];
+    if (!requests.length) {
+      fill(
+        historySlot,
+        emptyState({
+          title: "No scrim requests yet",
+          hint: ["Every attempt lands here, including the ones that fail."],
+        }),
+      );
+      return;
+    }
+    const tbody = el("tbody");
+    for (const request of requests) {
+      const opponent = requestOpponent(request);
+      const status = String(request.status || request.state || "unknown").toLowerCase();
+      const error = scrimErrorText(request.error || request.last_error);
+      const scoreFor = scrimFiniteNumber(request.score_for);
+      const scoreAgainst = scrimFiniteNumber(request.score_against);
+      const score = scoreFor !== null && scoreAgainst !== null
+        ? `${scoreFor}–${scoreAgainst}`
+        : "–";
+      const maps = normalizeScrimMaps(request.map_names);
+      const matchId = canonicalScrimUuid(request.match_id);
+      tbody.appendChild(
+        el(
+          "tr",
+          { "data-status": status },
+          el("td", { class: "col-time" }, platformRelativeTime(request.requested_at || request.created_at)),
+          el(
+            "td",
+            { class: "scrim-history-who" },
+            el("span", { title: opponent.id, text: opponent.name || opponent.id }),
+            // The source is a property of the row, not a column of its own.
+            request.source === "auto"
+              ? el("span", { class: "badge scrim-source", text: "auto" })
+              : null,
+          ),
+          el("td", { class: "num", text: requestVersions(request) }),
+          el("td", { class: "scrim-history-maps", text: maps.length ? maps.join(", ") : "random", title: maps.join(", ") }),
+          el("td", { class: "num strong", text: score }),
+          // Status and its explanation belong together: an error alone reads as
+          // noise, and a status alone hides why a request stopped.
+          el(
+            "td",
+            { class: "scrim-history-state" },
+            el("span", { class: "badge scrim-status", "data-status": status, text: status.replace(/_/g, " ") }),
+            error
+              ? el("span", { class: "scrim-history-error", text: error, title: error })
+              : null,
+          ),
+          el(
+            "td",
+            { class: "col-action" },
+            matchId
+              ? el("a", {
+                  class: "btn btn-xs btn-ghost",
+                  href: platformViewHash(matchId, 1),
+                  text: "View",
+                  title: "Open this match in the FCode viewer",
+                })
+              : null,
+          ),
+        ),
+      );
+    }
+    fill(
+      historySlot,
+      tableWrap(
+        el(
+          "table",
+          { class: "table table-compact scrim-history-table" },
+          el(
+            "thead",
+            null,
+            el(
+              "tr",
+              null,
+              el("th", { text: "When" }),
+              el("th", { text: "Opponent" }),
+              el("th", { text: "Versions" }),
+              el("th", { text: "Maps" }),
+              el("th", { class: "num", text: "Score" }),
+              el("th", { text: "Status" }),
+              el("th", { text: "" }),
+            ),
+          ),
+          tbody,
+        ),
+      ),
+    );
+  }
+
+  function targetNames(auto) {
+    const raw = auto?.target_team_names;
+    if (raw && !Array.isArray(raw) && typeof raw === "object") return raw;
+    const names = {};
+    if (Array.isArray(raw)) {
+      (Array.isArray(auto?.target_team_ids) ? auto.target_team_ids : []).forEach((id, index) => {
+        if (raw[index]) names[id] = raw[index];
+      });
+    }
+    for (const team of Array.isArray(auto?.target_teams) ? auto.target_teams : []) {
+      const id = canonicalScrimUuid(team?.id);
+      if (id && team?.name) names[id] = team.name;
+    }
+    return names;
+  }
+
+  function syncAutoscrimDraft() {
+    if (autoscrimDraftLoaded && autoscrimDirty) return;
+    const auto = dashboard?.autoscrim || {};
+    const names = targetNames(auto);
+    autoscrimTargets.clear();
+    for (const rawId of Array.isArray(auto.target_team_ids) ? auto.target_team_ids : []) {
+      const id = canonicalScrimUuid(rawId);
+      if (!id) continue;
+      const known = knownTeams.get(id);
+      autoscrimTargets.set(id, { id, name: String(names[id] || known?.name || "") });
+    }
+    autoscrimMaps.clear();
+    for (const name of normalizeScrimMaps(auto.map_names)) autoscrimMaps.add(name);
+    autoscrimEnabled.checked = auto.enabled === true;
+    autoscrimDraftLoaded = true;
+    autoscrimDirty = false;
+  }
+
+  function requestBlockReason() {
+    if (!dashboard) return "Loading scrim state…";
+    const session = dashboard.session || {};
+    if (session.authenticated !== true) return "Sign in with fcode login first.";
+    const submission = dashboard.active_submission;
+    if (!submission) return "No active FCode submission.";
+    if (submission.status && submission.status !== "ready") {
+      return `Active submission is ${String(submission.status).replace(/_/g, " ")}.`;
+    }
+    const auto = dashboard.autoscrim || {};
+    // A local cooldown delays dispatch; it does not prevent safely persisting a
+    // manual request. Unknown outcomes and authentication problems still block.
+    if (auto.can_request === false && String(auto.state || "") !== "backoff") {
+      return auto.blocked_reason || scrimErrorText(auto.last_error) || "Scrim requests are temporarily unavailable.";
+    }
+    return "";
+  }
+
+  function renderAutoscrimState() {
+    const auto = dashboard?.autoscrim || {};
+    const error = scrimErrorText(auto.last_error);
+    const backoff = deadlineNode(auto.backoff_until, "retry");
+    const next = !backoff ? deadlineNode(auto.next_attempt_at, "next") : null;
+    fill(
+      autoscrimStateSlot,
+      el("span", {
+        class: `badge scrim-status${error ? " scrim-status-error" : ""}`,
+        "data-status": String(auto.state || (auto.enabled ? "ready" : "off")),
+        text: autoscrimStateText(auto),
+        title: error,
+      }),
+      backoff || next,
+    );
+  }
+
+  function renderAvailability() {
+    const reason = requestBlockReason();
+    manualForm.inert = manualPending || !dashboard;
+    manualSubmit.disabled = manualPending || Boolean(reason);
+    manualSubmit.textContent = manualPending ? "Requesting…" : "Request scrim";
+    const backoff = scrimTimestamp(dashboard?.autoscrim?.backoff_until);
+    const rateLimitHint = String(dashboard?.autoscrim?.state || "") === "backoff"
+      && backoff !== null
+      && backoff > Date.now()
+      ? `Queued now, sent ${scrimCountdown(backoff)} when the quota frees up.`
+      : "";
+    manualBlocked.textContent = reason
+      || rateLimitHint
+      || "Five games, unrated, played with your active FCode submission.";
+    for (const control of manualForm.querySelectorAll("input, button")) {
+      if (control !== manualSubmit) control.disabled = manualPending || !dashboard;
+    }
+    const refreshing = refreshPending || dashboard?.refreshing === true;
+    refreshButton.disabled = refreshing;
+    refreshButton.textContent = refreshing ? "Refreshing…" : "Refresh";
+    autoscrimForm.inert = autoscrimPending || !dashboard;
+    for (const control of autoscrimForm.querySelectorAll("input, button")) {
+      control.disabled = autoscrimPending || !dashboard;
+    }
+    if (topTeamsPending) {
+      autoscrimTopKButton.disabled = true;
+      autoscrimTopKInput.disabled = true;
+      autoscrimTopKButton.textContent = "Adding…";
+    } else {
+      autoscrimTopKButton.disabled = !dashboard;
+      autoscrimTopKInput.disabled = !dashboard;
+      autoscrimTopKButton.textContent = "Add top teams";
+    }
+    saveAutoscrimButton.disabled = autoscrimPending || !dashboard;
+    saveAutoscrimButton.textContent = autoscrimPending ? "Saving…" : "Save autoscrim";
+    autoscrimEnabled.disabled = autoscrimPending || !dashboard;
+  }
+
+  function refreshClocks() {
+    for (const node of root.querySelectorAll("time[data-platform-relative-time]")) {
+      node.textContent = fmt.ago(node.getAttribute("datetime") || "");
+    }
+    for (const node of root.querySelectorAll("time[data-scrim-deadline]")) {
+      const deadline = Number(node.dataset.scrimDeadline);
+      const prefix = node.dataset.scrimPrefix || "retry";
+      node.textContent = `${prefix} ${scrimCountdown(deadline)}`;
+    }
+    renderAvailability();
+  }
+
+  function ingestDashboardTeams(data) {
+    for (const row of Array.isArray(data?.by_opponent) ? data.by_opponent : []) {
+      rememberTeam(row.opponent || { id: row.opponent_team_id, name: row.opponent_team_name });
+    }
+    for (const request of Array.isArray(data?.requests) ? data.requests : []) {
+      rememberTeam(request.opponent || {
+        id: request.opponent_team_id,
+        name: request.opponent_team_name,
+      });
+    }
+  }
+
+  function renderDashboard() {
+    ingestDashboardTeams(dashboard);
+    syncAutoscrimDraft();
+    void preloadTopSeedTeams();
+    renderBanner();
+    renderSummary();
+    renderVersions();
+    renderAutoscrimTargets();
+    renderScrimTopTeamChips();
+    renderMapPickers();
+    renderAutoscrimState();
+    renderOpponentStats();
+    renderHistory();
+    renderAvailability();
+    refreshClocks();
+  }
+
+  async function loadDashboard({ quiet = true } = {}) {
+    const request = ++dashboardRequest;
+    if (!quiet && !dashboard) {
+      fill(summarySlot, skeletonRows(2));
+      fill(opponentStatsSlot, skeletonRows(6));
+      fill(historySlot, skeletonRows(8));
+    }
+    try {
+      const query = new URLSearchParams({
+        limit: "100",
+        our_version: selectedVersion,
+      });
+      const data = await api(`/api/platform/scrims?${query.toString()}`);
+      if (!ctx.alive() || request !== dashboardRequest) return null;
+      dashboard = data && typeof data === "object" ? data : {};
+      renderDashboard();
+      return dashboard;
+    } catch (err) {
+      if (!ctx.alive() || request !== dashboardRequest) return null;
+      if (quiet && dashboard) return null;
+      fill(
+        summarySlot,
+        emptyState({
+          title: Number(err?.status) === 401 ? "Sign in to use scrims" : "Could not load scrims",
+          hint: [Number(err?.status) === 401 ? ["Run ", code("fcode login"), "."] : errorMessage(err)],
+          actions: [btn("Retry", { onclick: () => void loadDashboard({ quiet: false }) })],
+        }),
+      );
+      fill(opponentStatsSlot);
+      fill(historySlot);
+      return null;
+    }
+  }
+
+  async function loadOfficialMaps() {
+    const request = ++mapsRequest;
+    const [platformResult, localResult] = await Promise.allSettled([
+      api("/api/platform/maps"),
+      api("/api/maps"),
+    ]);
+    if (!ctx.alive() || request !== mapsRequest) return;
+    if (platformResult.status === "fulfilled") {
+      allowedMaps = (Array.isArray(platformResult.value?.maps) ? platformResult.value.maps : [])
+        .map((row) => String(row?.name || row || "").trim())
+        .filter(Boolean);
+    }
+    if (localResult.status === "fulfilled" && Array.isArray(localResult.value)) {
+      mapPreviews = new Map(
+        localResult.value.map((map) => [String(map?.name || ""), map]),
+      );
+    }
+    renderMapPickers();
+  }
+
+  async function refreshOfficial({ reportError = false } = {}) {
+    if (refreshPending) return false;
+    refreshPending = true;
+    renderAvailability();
+    try {
+      await api("/api/platform/scrims/refresh", { method: "POST", body: {} });
+      if (!ctx.alive()) return;
+      await loadDashboard({ quiet: true });
+      return true;
+    } catch (err) {
+      if (ctx.alive() && reportError) toast(`Could not refresh scrims: ${errorMessage(err)}`, "error");
+      return false;
+    } finally {
+      refreshPending = false;
+      if (ctx.alive()) renderAvailability();
+    }
+  }
+
+  manualForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (manualPending) return;
+    if (!dashboard) {
+      showManualError("Wait for scrim state to finish loading.");
+      return;
+    }
+    showManualError("");
+    try {
+      const opponent = manualPicker.value();
+      let requestKey = manualRequestKey || newScrimRequestKey();
+      let payload = buildScrimRequest({
+        requestKey,
+        opponentTeamId: opponent?.id || manualPicker.input.value,
+        opponentTeamName: opponent?.name || "",
+        sourceMatchId: sourceMatchInput.value,
+        mapNames: [...manualMaps],
+        ownTeamId: ownTeamId(),
+      });
+      const fingerprint = JSON.stringify({ ...payload, request_key: undefined });
+      if (manualRequestFingerprint !== null && manualRequestFingerprint !== fingerprint) {
+        requestKey = newScrimRequestKey();
+        payload = { ...payload, request_key: requestKey };
+      }
+      manualRequestKey = requestKey;
+      manualRequestFingerprint = fingerprint;
+      manualPending = true;
+      renderAvailability();
+      const response = await api("/api/platform/scrims", { method: "POST", body: payload });
+      if (!ctx.alive()) return;
+      const request = response?.request || response;
+      const matchId = canonicalScrimUuid(request?.match_id);
+      const requestState = String(request?.status || "");
+      const isRateLimitedNow = String(dashboard?.autoscrim?.state || "") === "backoff"
+        && scrimTimestamp(dashboard?.autoscrim?.backoff_until) !== null
+        && scrimTimestamp(dashboard?.autoscrim?.backoff_until) > Date.now();
+      manualRequestKey = null;
+      manualRequestFingerprint = null;
+      if (isRateLimitedNow || requestState === "rate_limited") {
+        toast("Scrim request accepted and will retry after rate limit backoff.", "warn");
+      } else if (matchId) {
+        toast("Scrim queued", "ok");
+      } else {
+        toast("Scrim request recorded", "ok");
+      }
+      await loadDashboard({ quiet: true });
+    } catch (err) {
+      if (!ctx.alive()) return;
+      const message = errorMessage(err);
+      const isRateLimited = Number(err?.status) === 429 || /rate limit/i.test(message);
+      if (isRateLimited) {
+        toast("Scrim request rate-limited; queued for retry.", "warn");
+        if (ctx.alive()) showManualError("");
+        return;
+      }
+      if (ctx.alive()) showManualError(message);
+    } finally {
+      manualPending = false;
+      if (ctx.alive()) renderAvailability();
+    }
+  });
+
+  async function saveAutoscrim({
+    restoreEnabled = null,
+    disableOnly = false,
+    preserveDraft = false,
+  } = {}) {
+    if (autoscrimPending) return false;
+    showAutoscrimError("");
+    if (!dashboard) {
+      showAutoscrimError("Wait for scrim state to finish loading.");
+      return false;
+    }
+    try {
+      const payload = disableOnly
+        ? { enabled: false }
+        : buildAutoscrimConfig({
+            enabled: autoscrimEnabled.checked,
+            targetTeams: [...autoscrimTargets.values()],
+            mapNames: [...autoscrimMaps],
+            ownTeamId: ownTeamId(),
+          });
+      autoscrimPending = true;
+      renderAvailability();
+      const response = await api("/api/platform/scrims/autoscrim", {
+        method: "POST",
+        body: payload,
+      });
+      if (!ctx.alive()) return false;
+      if (!disableOnly || !preserveDraft) autoscrimDirty = false;
+      const saved = response?.settings || response?.autoscrim;
+      if (saved && dashboard) {
+        dashboard = { ...dashboard, autoscrim: saved };
+        renderDashboard();
+      }
+      toast(payload.enabled ? "Autoscrim enabled" : "Autoscrim settings saved", "ok");
+      await loadDashboard({ quiet: true });
+      return true;
+    } catch (err) {
+      if (restoreEnabled !== null) autoscrimEnabled.checked = restoreEnabled;
+      if (ctx.alive()) showAutoscrimError(errorMessage(err));
+      return false;
+    } finally {
+      autoscrimPending = false;
+      if (ctx.alive()) renderAvailability();
+    }
+  }
+
+  autoscrimEnabled.addEventListener("change", () => {
+    const previous = !autoscrimEnabled.checked;
+    const preserveDraft = autoscrimDirty;
+    autoscrimDirty = true;
+    void saveAutoscrim({
+      restoreEnabled: previous,
+      disableOnly: autoscrimEnabled.checked === false,
+      preserveDraft,
+    });
+  });
+  autoscrimTopKButton.addEventListener("click", () => {
+    void addTopScrimTargets();
+  });
+  saveAutoscrimButton.addEventListener("click", () => {
+    autoscrimDirty = true;
+    void saveAutoscrim();
+  });
+
+  renderAutoscrimTargets();
+  renderScrimTopTeamChips();
+  renderMapPickers();
+  renderAvailability();
+  ctx.timer(refreshClocks, SCRIM_CLOCK_MS);
+  ctx.timer(() => void loadDashboard({ quiet: true }), SCRIM_POLL_MS);
+  ctx.on("platform_scrim", () => void loadDashboard({ quiet: true }));
+  void loadOfficialMaps();
+  void preloadTopSeedTeams();
+  void (async () => {
+    // Paint persisted local state first. The one initial refresh then imports
+    // existing/live official scrims without making ordinary polling upstream.
+    await loadDashboard({ quiet: false });
+    if (ctx.alive() && !scrimInitialRefreshIssued) {
+      scrimInitialRefreshIssued = await refreshOfficial();
+    }
+  })();
+});
+
+/* -------------------------------------------------------------------------- */
+
+/* 10. Storage                                                                 */
 /* -------------------------------------------------------------------------- */
 
 const storage = mount("storage", (root, params, ctx) => {
   const slot = el("div", { class: "stack" }, skeletonRows(3));
-  const view = viewRoot({ title: "Storage", sub: "" }, slot);
+  const view = viewRoot(
+    { title: "Storage", sub: "disk used by this arena" },
+    slot,
+  );
   root.appendChild(view);
 
   function render(data) {
@@ -4606,10 +7306,17 @@ const storage = mount("storage", (root, params, ctx) => {
     const temporary = data.temporary || {};
     const database = data.database || {};
     const retained = Number(replay.retained) || 0;
+    const replayBytes = Number(replay.bytes) || 0;
     const capped = replay.budget_bytes !== null && replay.budget_bytes !== undefined
       && Number.isFinite(Number(replay.budget_bytes));
     const budgetBytes = capped ? Number(replay.budget_bytes) : 0;
-    const usage = capped && budgetBytes > 0 ? Math.min(100, (Number(replay.bytes) / budgetBytes) * 100) : 0;
+    const usage = capped && budgetBytes > 0 ? Math.min(100, (replayBytes / budgetBytes) * 100) : 0;
+    const total = replayBytes + (Number(logs.bytes) || 0)
+      + (Number(database.bytes) || 0) + (Number(temporary.bytes) || 0);
+
+    // -- delete now ---------------------------------------------------------
+    // Two clicks, because this is the one control on the page that destroys
+    // data: the second click states exactly what is about to happen.
     let armed = false;
     const keep = el("input", {
       class: "input num storage-number",
@@ -4621,7 +7328,7 @@ const storage = mount("storage", (root, params, ctx) => {
       disabled: retained === 0,
       "aria-label": "Newest replays to keep",
     });
-    const purge = btn("Delete older replays", {
+    const purge = btn("Delete the rest", {
       class: "btn btn-danger",
       disabled: retained === 0,
       onclick: async (event) => {
@@ -4629,13 +7336,13 @@ const storage = mount("storage", (root, params, ctx) => {
         const count = Math.max(0, Math.min(retained, Math.round(Number(keep.value) || 0)));
         if (!armed) {
           armed = true;
-          button.textContent = `Confirm: keep newest ${count}, delete ${Math.max(0, retained - count)}`;
+          button.textContent = `Delete ${fmt.int(Math.max(0, retained - count))} replays`;
           return;
         }
         button.disabled = true;
         try {
           const result = await api("/api/storage/replays", { method: "POST", body: { keep: count } });
-          toast(`deleted ${fmt.int(result.removed)} replay(s), freed ${fmtBytes(result.freed)}`, "ok");
+          toast(`Deleted ${fmt.int(result.removed)} replays, freed ${fmtBytes(result.freed)}`, "ok");
           render(result.storage || data);
         } catch (err) {
           toast(errorMessage(err), "error");
@@ -4645,9 +7352,10 @@ const storage = mount("storage", (root, params, ctx) => {
     });
     keep.addEventListener("input", () => {
       armed = false;
-      purge.textContent = "Delete older replays";
+      purge.textContent = "Delete the rest";
     });
 
+    // -- automatic pruning --------------------------------------------------
     const budgetInput = el("input", {
       class: "input num storage-number",
       type: "number",
@@ -4662,10 +7370,10 @@ const storage = mount("storage", (root, params, ctx) => {
     const unlimited = el("input", {
       type: "checkbox",
       checked: !capped,
-      "aria-label": "Disable automatic replay pruning",
+      "aria-label": "Keep every replay",
       onchange: (event) => { budgetInput.disabled = event.currentTarget.checked; },
     });
-    const saveBudget = btn("Save budget", {
+    const saveBudget = btn("Save", {
       class: "btn",
       onclick: async (event) => {
         const button = event.currentTarget;
@@ -4674,7 +7382,7 @@ const storage = mount("storage", (root, params, ctx) => {
         try {
           const result = await api("/api/storage/budget", { method: "POST", body: { budget_mb: budget } });
           state.config = { ...(state.config || {}), replay_budget_mb: result.budget_mb };
-          toast(budget === null ? "automatic replay pruning disabled" : `replay budget set to ${budget} MB`, "ok");
+          toast(budget === null ? "Keeping every replay" : `Replay budget set to ${budget} MB`, "ok");
           render(result.storage || data);
         } catch (err) {
           toast(errorMessage(err), "error");
@@ -4683,76 +7391,94 @@ const storage = mount("storage", (root, params, ctx) => {
       },
     });
 
-    // The replay card already states the retained count; repeating it in the
-    // page subtitle adds noise without adding a second useful dimension.
-    view.setSub("");
+    view.setSub(`${fmtBytes(total)} on disk`);
     fill(
       slot,
+      // Where the space went, in one row, biggest first.
       el(
         "div",
-        { class: "grid grid-2" },
-        card(
-          { title: "Replay storage" },
-          el("div", { class: "storage-amount num", text: fmtBytes(replay.bytes) }),
-          el("p", { class: "mute", text: `${fmt.int(retained)} retained replays` }),
-          capped
-            ? el(
-                "div",
-                { class: "storage-meter-wrap" },
-                el("div", { class: "storage-meter", role: "progressbar", "aria-valuemin": "0", "aria-valuemax": "100", "aria-valuenow": String(Math.round(usage)) }, el("span", { style: { width: `${usage}%` } })),
-                el("span", { class: "small mute", text: `${fmtBytes(replay.bytes)} of ${fmtBytes(budgetBytes)} budget` })
-              )
-            : el("p", { class: "small mute", text: "Automatic pruning is disabled." })
-        ),
-        card(
-          { title: "Other storage" },
-          el("div", { class: "storage-other" },
-            el("span", null, "Logs"), el("strong", { class: "num", text: fmtBytes(logs.bytes) }),
-            el("span", null, "Database"), el("strong", { class: "num", text: fmtBytes(database.bytes) }),
-            el("span", null, "Temporary"), el("strong", { class: "num", text: fmtBytes(temporary.bytes) })
-          )
-        )
+        { class: "stats" },
+        statTile("Replays", fmtBytes(replayBytes), `${fmt.int(retained)} kept`),
+        statTile("Logs", fmtBytes(logs.bytes)),
+        statTile("Database", fmtBytes(database.bytes)),
+        statTile("Temporary", fmtBytes(temporary.bytes)),
       ),
       card(
-        { title: "Replay retention" },
-        el("p", { class: "mute", text: "Deleting replays preserves game results, ratings, source history and logs. Only the replay viewer becomes unavailable for those games." }),
+        { title: "Replays" },
         el(
-          "div",
-          { class: "row wrap storage-controls" },
-          el("label", { class: "field-label", text: "Keep newest replays" }),
-          keep,
-          purge
-        )
-      ),
-      card(
-        { title: "Replay budget" },
+          "p",
+          { class: "mute" },
+          "Deleting a replay only removes its 2D playback. Results, ratings, source history and logs are untouched.",
+        ),
+        capped
+          ? el(
+              "div",
+              { class: "storage-meter-wrap" },
+              el(
+                "div",
+                {
+                  class: "storage-meter",
+                  role: "progressbar",
+                  "aria-valuemin": "0",
+                  "aria-valuemax": "100",
+                  "aria-valuenow": String(Math.round(usage)),
+                  "data-over": replayBytes > budgetBytes ? "true" : null,
+                },
+                el("span", { style: { width: `${usage}%` } }),
+              ),
+              el("span", {
+                class: "small mute",
+                text: replayBytes > budgetBytes
+                  ? `${fmtBytes(replayBytes)} kept, over the ${fmtBytes(budgetBytes)} budget until the next prune`
+                  : `${fmtBytes(replayBytes)} of the ${fmtBytes(budgetBytes)} budget used`,
+              }),
+            )
+          : null,
         el(
           "div",
           { class: "row wrap storage-controls" },
           el("label", { class: "field-label", text: "Budget (MB)" }),
           budgetInput,
-          el("label", { class: "toggle" }, unlimited, el("span", { class: "toggle-track" }, el("span", { class: "toggle-thumb" })), el("span", { class: "toggle-label", text: "Uncapped" })),
-          saveBudget
+          el(
+            "label",
+            { class: "toggle" },
+            unlimited,
+            el("span", { class: "toggle-track" }, el("span", { class: "toggle-thumb" })),
+            el("span", { class: "toggle-label", text: "Keep everything" }),
+          ),
+          saveBudget,
         ),
-        el("p", { class: "small mute", text: "A cap prunes the oldest replays after games finish. Uncapped keeps replays until you remove them here." })
+        el("p", {
+          class: "small mute",
+          text: capped
+            ? "Oldest replays are pruned automatically once finished games push past the budget."
+            : "Nothing is pruned automatically. Replays grow until you delete them below.",
+        }),
+        el(
+          "div",
+          { class: "row wrap storage-controls" },
+          el("label", { class: "field-label", text: "Keep the newest" }),
+          keep,
+          purge,
+        ),
       ),
       card(
-        { title: "Reset" },
+        { title: "Danger zone" },
         el(
           "p",
           { class: "mute" },
-          "Choose between resetting just the ladder, or deleting all arena data including replays, logs and tracked bot history. Bot directories and maps always stay intact."
+          "Reset the ladder on its own, or erase every game, replay, log and tracked bot version. Your bot directories and maps are never touched.",
         ),
         el(
           "div",
           { class: "row wrap storage-controls" },
-          btn("Choose reset…", {
+          btn("Reset arena data…", {
             class: "btn btn-danger",
             title: "Choose how much arena data to reset",
             onclick: () => globalThis.oarena?.openResetDialog?.(),
-          })
-        )
-      )
+          }),
+        ),
+      ),
     );
   }
 
@@ -4781,4 +7507,5 @@ export const views = {
   maps,
   storage,
   fcode,
+  scrims,
 };

@@ -19,13 +19,28 @@
  *    `/api/state`.
  */
 
-import { api, applyGame, emit, fmt, refresh, state } from "./state.js";
+import {
+  api,
+  applyGame,
+  emit,
+  fmt,
+  refresh,
+  serverHelloChanges,
+  state,
+} from "./state.js";
+import { createMapPreview } from "./map-preview.js";
 import {
   botSuggestions,
   completedRunHash,
+  customSeedFitsRounds,
   loadRunDialogDraft,
+  MAX_CUSTOM_SEED,
+  MIN_CUSTOM_SEED,
   newWebMatchBatchTag,
+  normalizeCustomSeed,
   normalizeRunDialogDraft,
+  optimisticRunStatus,
+  runActivityLabel,
   saveRunDialogDraft,
   WebMatchCompletionTracker,
 } from "./run-form.js";
@@ -161,6 +176,7 @@ const dom = {
 // --------------------------------------------------------------------------
 
 const SQUARE_LAST_GAME_KEY = "oarena.square.last-game";
+const SQUARE_PREPARE_LIMIT = 4;
 
 function squareViewerManager() {
   const host = dom.squareViewerHost;
@@ -170,6 +186,7 @@ function squareViewerManager() {
     return {
       show() {},
       showReplay() {},
+      prepareGames() {},
       hide() {},
       setTheme() {},
       getGame: (id) => api(`/api/games/${encodeURIComponent(String(id))}`),
@@ -199,6 +216,10 @@ function squareViewerManager() {
   let primeBusy = false;
   let primeDone = false;
   let temporaryWake = false;
+  let prepareGeneration = 0;
+  let prepareQueue = [];
+  let currentPrepare = null;
+  let prepareIdle = null;
 
   const resizeObserver = typeof ResizeObserver === "function"
     ? new ResizeObserver(() => schedulePosition())
@@ -310,7 +331,9 @@ function squareViewerManager() {
     const key = String(game.id);
     detailCache.delete(key);
     detailCache.set(key, game);
-    while (detailCache.size > 4) detailCache.delete(detailCache.keys().next().value);
+    while (detailCache.size > SQUARE_PREPARE_LIMIT + 2) {
+      detailCache.delete(detailCache.keys().next().value);
+    }
     return game;
   }
 
@@ -389,11 +412,106 @@ function squareViewerManager() {
     };
   }
 
+  function cancelPrepareIdle() {
+    if (prepareIdle === null) return;
+    if (typeof cancelIdleCallback === "function") cancelIdleCallback(prepareIdle);
+    else clearTimeout(prepareIdle);
+    prepareIdle = null;
+  }
+
+  function schedulePrepare() {
+    if (
+      prepareIdle !== null ||
+      !ready ||
+      currentLoad ||
+      currentPrepare ||
+      prepareQueue.length === 0
+    ) {
+      return;
+    }
+    const run = () => {
+      prepareIdle = null;
+      if (!ready || currentLoad || currentPrepare) return;
+      const queued = prepareQueue.shift();
+      if (!queued || queued.generation !== prepareGeneration) {
+        schedulePrepare();
+        return;
+      }
+      const { source, retainKeys, warmTimeSeries } = queued;
+      const requestId = nextRequestId("prepare", source.key);
+      currentPrepare = { requestId, key: source.key, generation: queued.generation };
+      post({
+        type: "oarena:square:prepare",
+        requestId,
+        key: source.key,
+        replayUrl: source.replayUrl,
+        game: source.game,
+        retainKeys,
+        warmTimeSeries,
+      });
+    };
+    prepareIdle = typeof requestIdleCallback === "function"
+      ? requestIdleCallback(run)
+      : setTimeout(run, 250);
+  }
+
+  function cancelPrepares() {
+    prepareGeneration += 1;
+    prepareQueue = [];
+    currentPrepare = null;
+    cancelPrepareIdle();
+    if (ready) post({ type: "oarena:square:cancel-prepare" });
+  }
+
+  function prepareGames(rows, selectedId) {
+    cancelPrepares();
+    if (!Array.isArray(rows)) return;
+    const current = rows.find((row) => String(row?.id) === String(selectedId));
+    if (!current || !Number.isInteger(current.batch_ordinal)) return;
+    const candidates = rows
+      .filter((row) =>
+        row &&
+        Number.isSafeInteger(Number(row.id)) &&
+        Number(row.id) > 0 &&
+        row.has_replay === true &&
+        Number.isInteger(row.batch_ordinal) &&
+        row.batch_ordinal > current.batch_ordinal
+      )
+      .sort((left, right) =>
+        left.batch_ordinal - right.batch_ordinal || Number(left.id) - Number(right.id)
+      )
+      .slice(0, SQUARE_PREPARE_LIMIT);
+    if (candidates.length === 0) return;
+
+    const generation = prepareGeneration;
+    const retainKeys = [String(selectedId), ...candidates.map((row) => String(row.id))];
+    void (async () => {
+      for (let index = 0; index < candidates.length; index += 1) {
+        if (generation !== prepareGeneration) return;
+        try {
+          const game = await getGame(candidates[index].id);
+          if (generation !== prepareGeneration) return;
+          if (!game?.has_replay) continue;
+          prepareQueue.push({
+            generation,
+            source: localSource(game),
+            retainKeys,
+            warmTimeSeries: index === 0,
+          });
+          schedulePrepare();
+        } catch {
+          // A failed speculative detail request is retried normally on selection.
+        }
+      }
+    })();
+  }
+
   function sendLoad(source, { backgroundPrime = false } = {}) {
     if (!ready) {
       if (!backgroundPrime) pendingLoad = source;
       return;
     }
+    if (!backgroundPrime) cancelPrepares();
     pendingLoad = null;
     const { key, game } = source;
     temporaryWake = backgroundPrime && !activeSlot;
@@ -590,6 +708,20 @@ function squareViewerManager() {
       if (!activeSlot || activeKey === loadedKey) setStatus("loaded", "Replay loaded");
       sentVisibility = null;
       sendVisibility(host.dataset.active === "true");
+      schedulePrepare();
+      return;
+    }
+
+    if (
+      message.type === "oarena:square:prepared" ||
+      message.type === "oarena:square:prepare-error"
+    ) {
+      if (currentPrepare?.requestId !== message.requestId) return;
+      if (message.type === "oarena:square:prepared") {
+        rememberProfiler(currentPrepare.key, message.profilerRecords);
+      }
+      currentPrepare = null;
+      schedulePrepare();
       return;
     }
 
@@ -628,6 +760,7 @@ function squareViewerManager() {
     ready = false;
     loadedKey = null;
     currentLoad = null;
+    cancelPrepares();
     primeDone = Boolean(activeSource);
     temporaryWake = false;
     sentVisibility = null;
@@ -639,6 +772,7 @@ function squareViewerManager() {
   return {
     show,
     showReplay,
+    prepareGames,
     hide,
     setTheme,
     getGame,
@@ -654,9 +788,11 @@ const squareViewer = squareViewerManager();
 // theme
 // --------------------------------------------------------------------------
 
+const THEME_STORAGE_KEY = "oarena-theme";
+
 /**
  * Switch the theme everywhere: the `<html>` attribute the CSS keys off, the
- * project-persisted preference, and a `themechange` event. Square updates its
+ * browser-persisted preference, and a `themechange` event. Square updates its
  * persistent scene in place; the optional Official viewer still takes theme
  * through its iframe query string.
  */
@@ -666,11 +802,11 @@ export function setTheme(theme, { rerender = true, persist = true } = {}) {
   dom.root.dataset.theme = next;
   squareViewer.setTheme(next);
   if (persist) {
-    // Deliberately server-side rather than localStorage: a fresh `serve` may
-    // bind a different port, which is a different browser storage origin.
-    api("/api/theme", { method: "POST", body: { theme: next } }).catch((err) => {
-      toast(`theme changed for this page, but could not save it: ${err?.message || err}`, "error");
-    });
+    try {
+      globalThis.localStorage?.setItem(THEME_STORAGE_KEY, next);
+    } catch (err) {
+      toast(`theme changed for this page, but could not remember it: ${err?.message || err}`, "error");
+    }
   }
   const label = next === "dark" ? "Switch to the light theme" : "Switch to the dark theme";
   dom.btnTheme?.setAttribute("aria-label", label);
@@ -942,7 +1078,8 @@ function renderStatus() {
 
   const bits = [];
   if (running) {
-    bits.push(`${status.in_flight || 0} in flight`);
+    const activity = runActivityLabel(status);
+    if (activity) bits.push(activity);
     if (Number.isFinite(status.rate) && status.rate > 0) {
       bits.push(`${Math.round(status.rate)}/min`);
     }
@@ -995,6 +1132,7 @@ const ROUTES = {
   storage: { nav: "nav-storage", label: "Storage" },
   fcode: { nav: "nav-fcode", label: "FCode" },
   "test-runs": { nav: "nav-test-runs", label: "Test runs" },
+  scrims: { nav: "nav-scrims", label: "Scrims" },
 };
 
 const NAV_HASHES = [
@@ -1006,6 +1144,7 @@ const NAV_HASHES = [
   "#/storage",
   "#/fcode",
   "#/test-runs",
+  "#/scrims",
 ];
 
 function decodeSegment(text) {
@@ -1055,6 +1194,8 @@ export function parseRoute(raw) {
       return tail === undefined ? route("fcode") : null;
     case "test-runs":
       return tail === undefined ? route("test-runs") : null;
+    case "scrims":
+      return tail === undefined ? route("scrims") : null;
     default:
       return null;
   }
@@ -1182,6 +1323,7 @@ const SSE_TYPES = [
   "status",
   "run_started",
   "run_finished",
+  "platform_scrim",
 ];
 
 const BACKOFF_MIN = 500;
@@ -1202,6 +1344,47 @@ let expectedSeq = null;
  */
 const webMatchCompletions = new WebMatchCompletionTracker();
 const webMatchReconciliations = new Map();
+const webMatchReconcileTimers = new Map();
+const webMatchReconcileAttempts = new Map();
+const webMatchReconcileWarned = new Set();
+const WEB_MATCH_RECONCILE_MIN_MS = 1000;
+const WEB_MATCH_RECONCILE_MAX_MS = 5000;
+
+function isAcceptedWebMatch(tag) {
+  return webMatchCompletions.acceptedTags().includes(tag);
+}
+
+function stopWebMatchReconciliation(tag) {
+  const timer = webMatchReconcileTimers.get(tag);
+  if (timer !== undefined) clearTimeout(timer);
+  webMatchReconcileTimers.delete(tag);
+  webMatchReconcileAttempts.delete(tag);
+  webMatchReconcileWarned.delete(tag);
+}
+
+function scheduleWebMatchReconciliation(tag, { immediate = false } = {}) {
+  if (!isAcceptedWebMatch(tag)) {
+    stopWebMatchReconciliation(tag);
+    return;
+  }
+  if (webMatchReconciliations.has(tag)) return;
+  const pending = webMatchReconcileTimers.get(tag);
+  if (pending !== undefined) {
+    if (!immediate) return;
+    clearTimeout(pending);
+    webMatchReconcileTimers.delete(tag);
+  }
+  const attempt = webMatchReconcileAttempts.get(tag) || 0;
+  const delay = immediate
+    ? 0
+    : Math.min(WEB_MATCH_RECONCILE_MAX_MS, WEB_MATCH_RECONCILE_MIN_MS * (2 ** attempt));
+  if (!immediate) webMatchReconcileAttempts.set(tag, attempt + 1);
+  const timer = setTimeout(() => {
+    webMatchReconcileTimers.delete(tag);
+    void reconcileWebMatch(tag);
+  }, delay);
+  webMatchReconcileTimers.set(tag, timer);
+}
 
 function fetchWebMatchBatch(tag) {
   const query = new URLSearchParams({ tag, limit: "500" });
@@ -1221,6 +1404,7 @@ function openCompletedWebMatch(hash) {
 
 function consumeCompletedWebMatch(completion, recoveredGames = null) {
   if (!completion) return;
+  stopWebMatchReconciliation(completion.tag);
 
   // Normally the ordinal-zero game_finished precedes run_finished, so this is
   // the immediate path. If a reconnect missed even part of the game stream,
@@ -1247,34 +1431,83 @@ function consumeCompletedWebMatch(completion, recoveredGames = null) {
 }
 
 function reconcileWebMatch(tag) {
+  if (!isAcceptedWebMatch(tag)) {
+    stopWebMatchReconciliation(tag);
+    return null;
+  }
   if (webMatchReconciliations.has(tag)) return webMatchReconciliations.get(tag);
+  const timer = webMatchReconcileTimers.get(tag);
+  if (timer !== undefined) clearTimeout(timer);
+  webMatchReconcileTimers.delete(tag);
+  let retry = false;
   const reconciliation = (async () => {
     try {
       const batch = await fetchWebMatchBatch(tag);
+      webMatchReconcileWarned.delete(tag);
       if (batch?.mode !== "match") {
         webMatchCompletions.reject(tag);
+        stopWebMatchReconciliation(tag);
         return;
       }
-      if (batch.status === "running") return;
+      if (batch.status === "running") {
+        retry = true;
+        return;
+      }
       const games = Array.isArray(batch.games) ? batch.games : [];
       if (games[0]) webMatchCompletions.captureGame(games[0]);
+      settleOptimisticWebMatch(tag, {
+        played: batch.played_games,
+        total: batch.requested_games,
+      });
       consumeCompletedWebMatch(
         webMatchCompletions.captureRunFinished({ mode: "match", batch_tag: tag }),
         games,
       );
     } catch (err) {
-      if (err?.status === 404) webMatchCompletions.reject(tag);
-      appendLog("warn", `could not reconcile Match run: ${err?.message || err}`);
+      if (err?.status === 404) {
+        webMatchCompletions.reject(tag);
+        stopWebMatchReconciliation(tag);
+        return;
+      }
+      retry = true;
+      if (!webMatchReconcileWarned.has(tag)) {
+        webMatchReconcileWarned.add(tag);
+        appendLog("warn", `could not reconcile Match run: ${err?.message || err}`);
+      }
     }
   })().finally(() => {
     webMatchReconciliations.delete(tag);
+    if (retry) scheduleWebMatchReconciliation(tag);
   });
   webMatchReconciliations.set(tag, reconciliation);
   return reconciliation;
 }
 
 function reconcileCompletedWebMatches() {
-  for (const tag of webMatchCompletions.acceptedTags()) void reconcileWebMatch(tag);
+  for (const tag of webMatchCompletions.acceptedTags()) {
+    scheduleWebMatchReconciliation(tag, { immediate: true });
+  }
+}
+
+function settleOptimisticWebMatch(tag, { played = null, total = null } = {}) {
+  if (state.status?.web_match_tag !== tag) return;
+  const finished = Number.isSafeInteger(played) && played >= 0
+    ? played
+    : state.status.done;
+  const planned = Number.isSafeInteger(total) && total >= 0
+    ? total
+    : state.status.total;
+  state.status = {
+    ...state.status,
+    running: false,
+    stopping: false,
+    queued: 0,
+    in_flight: 0,
+    done: finished,
+    total: planned,
+    web_match_tag: null,
+  };
+  renderStatus();
 }
 
 function setConnection(status) {
@@ -1340,10 +1573,12 @@ function requestFullRefresh(reason) {
     refreshTimer = null;
     try {
       await refresh();
+      if (reloadForWebRevisionChange()) return;
       expectedSeq = state.seq + 1;
       renderShell();
       renderStatus();
       safeRefreshView();
+      refreshOpenRunCatalog?.();
       reconcileCompletedWebMatches();
     } catch (err) {
       appendLog("error", `resync failed (${reason}): ${err.message}`);
@@ -1351,10 +1586,31 @@ function requestFullRefresh(reason) {
   }, 250);
 }
 
+function reloadForWebRevisionChange() {
+  const loaded = state.webRevision;
+  const served = state.serverWebRevision;
+  if (!loaded || !served || loaded === served) return false;
+  location.reload();
+  return true;
+}
+
 function onHello(data) {
   backoff = BACKOFF_MIN;
   goOnline();
+  const identity = serverHelloChanges(state, data);
+  if (identity.webChanged) {
+    location.reload();
+    return;
+  }
   const head = Number(data?.seq);
+  if (identity.instanceChanged) {
+    if (Number.isFinite(head)) {
+      state.seq = head;
+      expectedSeq = head + 1;
+    }
+    requestFullRefresh("the arena restarted");
+    return;
+  }
   if (!Number.isFinite(head)) return;
   if (head < state.seq) {
     // The bus counter went backwards: the server was restarted under us.
@@ -1425,6 +1681,7 @@ function dispatch(type, data, atMs) {
         state.bots[data.name].bot.active = data.active !== false;
       }
       state.matrix = null;
+      refreshOpenRunCatalog?.();
       emit("bot", { event: type, ...data });
       emit("ladder", state.ladder);
       break;
@@ -1442,6 +1699,7 @@ function dispatch(type, data, atMs) {
         `${data.mode} finished — ${fmt.int(data.played)} games${data.stopped ? " (stopped)" : ""}`,
         atMs,
       );
+      settleOptimisticWebMatch(data.batch_tag, { played: data.played });
       consumeCompletedWebMatch(webMatchCompletions.captureRunFinished(data));
       break;
 
@@ -1520,6 +1778,9 @@ function forceReconnect() {
 // run dialog
 // --------------------------------------------------------------------------
 
+let runStartInFlight = false;
+let refreshOpenRunCatalog = null;
+
 function clampInt(value, min, max, fallback) {
   const n = Number.parseInt(value, 10);
   if (!Number.isFinite(n)) return fallback;
@@ -1539,7 +1800,7 @@ function runDialogStorage() {
 }
 
 /** Bind one accessible, recency-aware bot picker without constraining free text. */
-function createBotCombobox(input, list, { everyone = false } = {}) {
+function createBotCombobox(input, list, { everyone = false, includeInactive = false } = {}) {
   let choices = [];
   let active = -1;
   let blurTimer = 0;
@@ -1576,7 +1837,11 @@ function createBotCombobox(input, list, { everyone = false } = {}) {
   }
 
   function render({ resetActive = true } = {}) {
-    choices = botSuggestions(state.ladder, input.value, { everyone, limit: 10 });
+    choices = botSuggestions(state.ladder, input.value, {
+      everyone,
+      includeInactive,
+      limit: 10,
+    });
     const options = choices.map((row, index) => {
       const tags = [];
       if (row.everyone) tags.push("everyone");
@@ -1640,7 +1905,13 @@ function createBotCombobox(input, list, { everyone = false } = {}) {
     }
   });
 
-  return { close };
+  function refreshPicker() {
+    if (document.activeElement === input || !list.hidden) {
+      render({ resetActive: false });
+    }
+  }
+
+  return { close, refresh: refreshPicker };
 }
 
 /**
@@ -1652,6 +1923,10 @@ function createBotCombobox(input, list, { everyone = false } = {}) {
  * on the server.
  */
 export function openRunDialog(initialTab = null) {
+  if (runStartInFlight) {
+    toast("a run is already being started", "warn");
+    return;
+  }
   const template = $("tpl-run-dialog");
   if (!template) return;
   const node = template.content.cloneNode(true).firstElementChild;
@@ -1669,6 +1944,11 @@ export function openRunDialog(initialTab = null) {
   const officialMapSet = q("run-maps-official");
   const extraMapSet = q("run-maps-extra");
   const repeat = q("run-repeat");
+  const seedPolicyField = q("run-seed-policy-field");
+  const seedPolicy = q("run-seed-policy");
+  const seedField = q("run-seed-field");
+  const seed = q("run-seed");
+  const seedHelp = q("run-seed-help");
   const mirror = q("run-mirror");
   const rated = q("run-rated");
   const countLine = q("run-count");
@@ -1683,28 +1963,37 @@ export function openRunDialog(initialTab = null) {
   const errorLine = q("run-error");
   const cancel = q("run-cancel");
   const submit = q("run-submit");
+  const mapPreview = createMapPreview(node);
+  const noBotsMessage = "No bots on disk — add a directory containing main.py and press Sync.";
 
   const storage = runDialogStorage();
   const project = state.config?.root || state.config?.name || "default";
-  const activeBots = state.ladder.filter((row) => row.active !== false);
-  const names = activeBots.map((row) => row.name);
+  const availableBots = state.ladder.filter((row) => row.source_present !== false);
+  const activeNames = availableBots
+    .filter((row) => row.active !== false)
+    .map((row) => row.name);
+  const names = availableBots.map((row) => row.name);
+  const preferredNames = activeNames.length ? activeNames : names;
   const mapNames = state.maps.map((map) => map.name);
   const configured = new Set(state.config?.maps || []);
   const defaultMaps = mapNames.filter((name) => configured.size === 0 || configured.has(name));
   const restored = normalizeRunDialogDraft(loadRunDialogDraft(storage, project), {
     botNames: names,
+    arenaBotNames: activeNames,
     mapNames,
     defaults: {
       tab: "match",
       match: {
-        a: names[0] ?? "",
-        b: names[1] ?? (names.length ? "*" : ""),
+        a: preferredNames[0] ?? "",
+        b: preferredNames[1] ?? (preferredNames.length ? "*" : ""),
         maps: defaultMaps,
         repeat: 1,
         mirror: state.config?.mirror !== false,
         rated: true,
+        seedPolicy: state.config?.seed_policy === "fixed" ? "fixed" : "random",
+        seed: normalizeCustomSeed(state.config?.seed_exact ?? state.config?.seed) ?? "1",
       },
-      arena: { kind: "ladder", top: 8, target: names[0] ?? "", rated: true },
+      arena: { kind: "ladder", top: 8, target: activeNames[0] ?? "", rated: true },
     },
   });
   const matchDraft = restored.match;
@@ -1718,10 +2007,26 @@ export function openRunDialog(initialTab = null) {
   botB.value = matchDraft.b;
   arenaTarget.value = arenaDraft.target;
   const botPickers = [
-    createBotCombobox(botA, botAOptions),
-    createBotCombobox(botB, botBOptions, { everyone: true }),
+    createBotCombobox(botA, botAOptions, { includeInactive: true }),
+    createBotCombobox(botB, botBOptions, { everyone: true, includeInactive: true }),
     createBotCombobox(arenaTarget, arenaTargetOptions),
   ];
+  const currentAvailableBots = () => state.ladder.filter(
+    (row) => row.source_present !== false,
+  );
+  const currentActiveNames = () => currentAvailableBots()
+    .filter((row) => row.active !== false)
+    .map((row) => row.name);
+  const refreshBotCatalog = () => {
+    for (const picker of botPickers) picker.refresh();
+    const hasBots = currentAvailableBots().length > 0;
+    if (!runStartInFlight) submit.disabled = !hasBots;
+    if (!hasBots) fail(noBotsMessage);
+    else if (errorLine.textContent === noBotsMessage) {
+      errorLine.textContent = "";
+      errorLine.hidden = true;
+    }
+  };
 
   // --- maps ---
   const restoredMaps = new Set(matchDraft.maps);
@@ -1744,6 +2049,7 @@ export function openRunDialog(initialTab = null) {
       updateCount();
       persistDraft();
     });
+    mapPreview.bind(chip, map);
     return chip;
   };
   const officialChips = state.maps
@@ -1784,12 +2090,32 @@ export function openRunDialog(initialTab = null) {
 
   // --- restored values, falling back to project/template defaults ---
   repeat.value = String(matchDraft.repeat);
+  seedPolicy.value = matchDraft.seedPolicy;
+  seed.value = String(matchDraft.seed);
+  let lastValidSeed = matchDraft.seed;
   mirror.checked = matchDraft.mirror;
   rated.checked = matchDraft.rated;
   arenaKind.value = arenaDraft.kind;
   arenaTop.value = String(arenaDraft.top);
   arenaRated.checked = arenaDraft.rated;
   arenaWorkers.value = String(state.config?.workers ?? "");
+
+  function customSeedValue() {
+    return normalizeCustomSeed(seed.value);
+  }
+
+  function syncSeedFields() {
+    const applies = botB.value.trim() !== "*";
+    seedPolicyField.hidden = !applies;
+    seedField.hidden = !applies || seedPolicy.value !== "fixed";
+    seedHelp.hidden = !applies;
+  }
+
+  function rememberedCustomSeed() {
+    const value = customSeedValue();
+    if (value !== null) lastValidSeed = value;
+    return lastValidSeed;
+  }
 
   function persistDraft() {
     saveRunDialogDraft(storage, project, {
@@ -1801,6 +2127,8 @@ export function openRunDialog(initialTab = null) {
         repeat: clampInt(repeat.value, 1, 500, 1),
         mirror: mirror.checked,
         rated: rated.checked,
+        seedPolicy: seedPolicy.value,
+        seed: rememberedCustomSeed(),
       },
       arena: {
         kind: arenaKind.value,
@@ -1813,7 +2141,8 @@ export function openRunDialog(initialTab = null) {
 
   /** "15 maps × 2 rounds × 2 sides = **60 games**", live. */
   function updateCount() {
-    if (botB.value === "*") {
+    syncSeedFields();
+    if (botB.value.trim() === "*") {
       mount(countLine, 
         `${botA.value || "this bot"} against every other bot — runs as an arena until you press `,
         el("b", null, "Stop"),
@@ -1831,7 +2160,7 @@ export function openRunDialog(initialTab = null) {
     );
   }
 
-  function setTab(next) {
+  function setTab(next, { persist = true } = {}) {
     tab = next;
     const onMatch = next === "match";
     tabMatch.setAttribute("aria-selected", onMatch ? "true" : "false");
@@ -1840,7 +2169,7 @@ export function openRunDialog(initialTab = null) {
     panelArena.hidden = onMatch;
     for (const picker of botPickers) picker.close();
     submit.textContent = onMatch ? "Start match" : "Start arena";
-    persistDraft();
+    if (persist) persistDraft();
   }
 
   function syncArenaFields() {
@@ -1854,6 +2183,8 @@ export function openRunDialog(initialTab = null) {
   }
 
   async function start() {
+    if (runStartInFlight || submit.disabled) return;
+    runStartInFlight = true;
     errorLine.hidden = true;
     errorLine.textContent = "";
     submit.disabled = true;
@@ -1861,6 +2192,7 @@ export function openRunDialog(initialTab = null) {
     // still in flight. Remember the live-feed position so the optimistic
     // "running" state below cannot overwrite a newer completed status.
     const eventSeqAtSubmit = state.seq;
+    let optimisticRun = null;
     try {
       botA.value = botA.value.trim();
       botB.value = botB.value.trim();
@@ -1869,6 +2201,9 @@ export function openRunDialog(initialTab = null) {
       if (tab === "arena") {
         const kind = arenaKind.value;
         if (kind === "vs" && !arenaTarget.value) throw new Error("pick a target bot");
+        if (kind === "vs" && !currentActiveNames().includes(arenaTarget.value)) {
+          throw new Error("Arena targets must be enabled in Bots");
+        }
         await api("/api/arena", {
           method: "POST",
           body: {
@@ -1878,18 +2213,41 @@ export function openRunDialog(initialTab = null) {
             rated: arenaRated.checked,
           },
         });
+        optimisticRun = {
+          mode: kind === "vs" ? "vs" : "arena",
+          label: kind === "vs" ? `${arenaTarget.value} vs field` : `${kind} arena`,
+          total: null,
+        };
         toast(`arena started (${kind})`, "ok");
       } else if (botB.value === "*") {
         if (!botA.value) throw new Error("pick a bot");
+        if (!currentActiveNames().includes(botA.value)) {
+          throw new Error("enable this bot in Bots before running it against everyone");
+        }
         await api("/api/arena", {
           method: "POST",
           body: { kind: "vs", target: botA.value, rated: rated.checked },
         });
+        optimisticRun = {
+          mode: "vs",
+          label: `${botA.value} vs everyone`,
+          total: null,
+        };
         toast(`arena started — ${botA.value} vs everyone`, "ok");
       } else {
         const maps = selectedMaps();
+        const rounds = clampInt(repeat.value, 1, 500, 1);
+        const customSeed = seedPolicy.value === "fixed" ? customSeedValue() : null;
         if (!botA.value || !botB.value) throw new Error("pick both bots");
         if (maps.length === 0) throw new Error("pick at least one map");
+        if (seedPolicy.value === "fixed" && customSeed === null) {
+          throw new Error(
+            `custom seed must be a whole number from ${MIN_CUSTOM_SEED} to ${MAX_CUSTOM_SEED}`,
+          );
+        }
+        if (customSeed !== null && !customSeedFitsRounds(customSeed, rounds)) {
+          throw new Error(`custom seed plus ${rounds} rounds exceeds ${MAX_CUSTOM_SEED}`);
+        }
         const batchTag = newWebMatchBatchTag();
         if (!webMatchCompletions.arm(batchTag)) {
           throw new Error("could not reserve this Match run; please try again");
@@ -1902,9 +2260,11 @@ export function openRunDialog(initialTab = null) {
               a: botA.value,
               b: botB.value,
               maps,
-              repeat: clampInt(repeat.value, 1, 500, 1),
+              repeat: rounds,
               mirror: mirror.checked,
               rated: rated.checked,
+              seed_policy: seedPolicy.value,
+              seed: customSeed,
               tag: batchTag,
             },
           });
@@ -1918,21 +2278,28 @@ export function openRunDialog(initialTab = null) {
         }
         const completion = webMatchCompletions.accept(batchTag);
         consumeCompletedWebMatch(completion);
-        if (!completion && !state.online) void reconcileWebMatch(batchTag);
+        if (!completion) scheduleWebMatchReconciliation(batchTag);
+        optimisticRun = {
+          mode: "match",
+          label: `${botA.value} vs ${botB.value}`,
+          total: result?.total,
+          batchTag,
+        };
         toast(`match queued — ${plural(result?.total ?? 0, "game")}`, "ok");
       }
-      closeModal();
+      if (dom.modalHost?.contains(node)) closeModal();
       // The server's own status event follows within 500 ms; this keeps the
       // pill from reading "idle" in the meantime. If any server event arrived
       // during the request, its state is authoritative (the whole run may
       // already have finished), so leave it alone.
       if (state.seq === eventSeqAtSubmit) {
-        state.status = { ...(state.status || {}), running: true, stopping: false };
+        state.status = optimisticRunStatus(state.status, optimisticRun);
         renderStatus();
       }
     } catch (err) {
       fail(err?.message || String(err));
     } finally {
+      runStartInFlight = false;
       submit.disabled = false;
     }
   }
@@ -1942,6 +2309,8 @@ export function openRunDialog(initialTab = null) {
   botA.addEventListener("input", () => { updateCount(); persistDraft(); });
   botB.addEventListener("input", () => { updateCount(); persistDraft(); });
   repeat.addEventListener("input", () => { updateCount(); persistDraft(); });
+  seedPolicy.addEventListener("change", () => { syncSeedFields(); persistDraft(); });
+  seed.addEventListener("input", persistDraft);
   mirror.addEventListener("change", () => { updateCount(); persistDraft(); });
   rated.addEventListener("change", persistDraft);
   swap.addEventListener("click", () => {
@@ -1959,27 +2328,37 @@ export function openRunDialog(initialTab = null) {
   q("run-close").addEventListener("click", () => { persistDraft(); closeModal(); });
   cancel.addEventListener("click", () => { persistDraft(); closeModal(); });
   submit.addEventListener("click", start);
-  // Enter submits from a field, but never from a button — Cancel and Close
-  // must stay Cancel and Close.
+  // Enter submits from text/number fields, but not selects or buttons. Native
+  // select Enter must only choose the seed policy; Cancel and Close stay inert.
   node.addEventListener("keydown", (event) => {
-    const field =
-      event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement;
+    const field = event.target instanceof HTMLInputElement;
     if (!event.defaultPrevented && event.key === "Enter" && field) {
       event.preventDefault();
       start();
     }
   });
 
-  setTab(tab);
+  // Merely opening (and toggling closed) must not change the saved mode.
+  // Starting or explicitly choosing a tab still persists it.
+  setTab(tab, { persist: false });
   syncArenaFields();
   updateCount();
 
-  if (activeBots.length === 0) {
-    fail("No enabled bots — enable one in Bots or add a directory containing main.py and press Sync.");
+  if (availableBots.length === 0) {
+    fail(noBotsMessage);
     submit.disabled = true;
   }
 
-  openModal(node);
+  openModal(node, {
+    onClose: () => {
+      if (refreshOpenRunCatalog === refreshBotCatalog) refreshOpenRunCatalog = null;
+      mapPreview.destroy();
+    },
+  });
+  refreshOpenRunCatalog = refreshBotCatalog;
+  // Make the keyboard path `r`, Enter exactly equivalent to opening Match and
+  // pressing its primary action. Disabled submits leave focus on Close.
+  if (!submit.disabled) submit.focus({ preventScroll: true });
 }
 
 /** The `?` sheet, straight out of its template. */
@@ -2027,10 +2406,12 @@ async function syncNow() {
     toast(`sync: ${summary}`, summary === "nothing changed" ? "info" : "ok");
     appendLog("info", `sync — ${summary}`);
     await refresh();
+    if (reloadForWebRevisionChange()) return;
     expectedSeq = state.seq + 1;
     renderShell();
     renderStatus();
     safeRefreshView();
+    refreshOpenRunCatalog?.();
   } catch (err) {
     toast(`sync failed: ${err.message}`, "error");
   } finally {
@@ -2080,6 +2461,7 @@ export function openResetDialog() {
       await api("/api/reset", { method: "POST", body: clean ? { all: true, clean: true } : {} });
       closeModal();
       await refresh();
+      if (reloadForWebRevisionChange()) return;
       expectedSeq = state.seq + 1;
       renderShell();
       renderStatus();
@@ -2135,6 +2517,17 @@ function focusFilter() {
   return true;
 }
 
+/** Toggle only the Run dialog; never replace a different open modal. */
+function toggleRunDialog() {
+  if (dom.modalHost?.querySelector("#run-dialog")) {
+    closeModal();
+    return true;
+  }
+  if (!dom.modalHost?.hidden) return false;
+  openRunDialog("match");
+  return true;
+}
+
 function onKeydown(event) {
   if (event.defaultPrevented) return;
 
@@ -2155,11 +2548,15 @@ function onKeydown(event) {
 
   if (isTyping(event.target)) return;
   if (event.ctrlKey || event.metaKey || event.altKey) return;
-  // A modal owns the keyboard while it is up: `r` would reset a half-filled
-  // dialog and a number shortcut would navigate the view hidden behind it.
+  if (event.key === "r" && !event.repeat && toggleRunDialog()) {
+    event.preventDefault();
+    return;
+  }
+  // Every modal other than Run owns the keyboard while it is up; number
+  // shortcuts must not navigate the view hidden behind it.
   if (!dom.modalHost.hidden) return;
 
-  const index = "12345678".indexOf(event.key);
+  const index = "123456789".indexOf(event.key);
   if (index >= 0) {
     event.preventDefault();
     navigate(NAV_HASHES[index]);
@@ -2167,10 +2564,6 @@ function onKeydown(event) {
   }
 
   switch (event.key) {
-    case "r":
-      event.preventDefault();
-      openRunDialog();
-      break;
     case "s":
       event.preventDefault();
       stopRun();
@@ -2242,6 +2635,7 @@ async function boot() {
 
   try {
     await refresh();
+    if (reloadForWebRevisionChange()) return;
     renderShell();
     renderStatus();
   } catch (err) {

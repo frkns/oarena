@@ -1,4 +1,4 @@
-"""A small, bounded RPC transport for the read-only FCode platform client.
+"""A small, bounded RPC transport for the FCode platform client.
 
 The normal ``oarena serve`` process talks to :class:`FcodePlatform` directly.
 Hardened installations can instead run :mod:`oarena.platform_sidecar` outside
@@ -41,6 +41,9 @@ _MAX_REPLAY_BODY_BYTES = 64 << 20
 _MAX_REQUEST_BODY_BYTES = 0
 _MAX_CURSOR_CHARS = 2048
 _MAX_ERROR_CHARS = 512
+_MAX_TEAM_QUERY_CHARS = 200
+_MAX_MAP_NAME_CHARS = 200
+_MAX_RETRY_AFTER_S = 7 * 24 * 60 * 60
 _MAX_SOCKET_PATH_BYTES = 103
 # Replay is two sequential remote calls (signed URL, then object storage), and
 # urllib's timeout applies to individual socket operations rather than the whole
@@ -49,7 +52,18 @@ _MAX_SOCKET_PATH_BYTES = 103
 _DEFAULT_TIMEOUT_S = 60.0
 
 _OPERATIONS = frozenset(
-    {"session", "ladder", "test_runs", "matches", "match", "replay"}
+    {
+        "session",
+        "scrim_profile",
+        "team_search",
+        "platform_maps",
+        "request_unrated",
+        "ladder",
+        "test_runs",
+        "matches",
+        "match",
+        "replay",
+    }
 )
 
 
@@ -138,9 +152,28 @@ def _optional_text(value: Any, name: str, limit: int) -> str | None:
         return None
     if not isinstance(value, str) or not value or len(value) > limit:
         raise PlatformError(400, f"{name} is invalid")
-    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+    if any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value):
         raise PlatformError(400, f"{name} is invalid")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise PlatformError(400, f"{name} is invalid") from exc
     return value
+
+
+def _required_text(value: Any, name: str, limit: int) -> str:
+    text = _optional_text(value, name, limit)
+    if text is None or not text.strip():
+        raise PlatformError(400, f"{name} is invalid")
+    return text.strip()
+
+
+def _map_names(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        raise PlatformError(400, "map_names must be a list")
+    if len(value) > 5:
+        raise PlatformError(400, "map_names may contain at most 5 maps")
+    return [_required_text(item, "map name", _MAX_MAP_NAME_CHARS) for item in value]
 
 
 def _validate_call(op: Any, raw_args: Any) -> tuple[str, dict[str, Any]]:
@@ -148,9 +181,47 @@ def _validate_call(op: Any, raw_args: Any) -> tuple[str, dict[str, Any]]:
     if not isinstance(op, str) or op not in _OPERATIONS:
         raise PlatformError(400, "unsupported platform operation")
 
-    if op == "session":
+    if op in {"session", "scrim_profile", "platform_maps"}:
         args = _exact_keys(raw_args, allowed=frozenset(), name="argument")
         return op, args
+
+    if op == "team_search":
+        args = _exact_keys(
+            raw_args,
+            allowed=frozenset({"query", "limit"}),
+            required=frozenset({"query", "limit"}),
+            name="argument",
+        )
+        return op, {
+            "query": _required_text(
+                args["query"], "query", _MAX_TEAM_QUERY_CHARS
+            ),
+            "limit": _bounded_int(args["limit"], "limit", 1, 20),
+        }
+
+    if op == "request_unrated":
+        args = _exact_keys(
+            raw_args,
+            allowed=frozenset(
+                {"opponent_team_id", "source_match_id", "map_names"}
+            ),
+            required=frozenset(
+                {"opponent_team_id", "source_match_id", "map_names"}
+            ),
+            name="argument",
+        )
+        source_match_id = args["source_match_id"]
+        return op, {
+            "opponent_team_id": _canonical_uuid(
+                args["opponent_team_id"], "opponent_team_id"
+            ),
+            "source_match_id": (
+                None
+                if source_match_id is None
+                else _canonical_uuid(source_match_id, "source_match_id")
+            ),
+            "map_names": _map_names(args["map_names"]),
+        }
 
     if op in {"ladder", "test_runs"}:
         args = _exact_keys(
@@ -338,6 +409,31 @@ class UnixPlatformClient:
     def session(self) -> dict[str, Any]:
         return self._json_call("session", {})
 
+    def scrim_profile(self) -> dict[str, Any]:
+        return self._json_call("scrim_profile", {})
+
+    def team_search(self, query: str, *, limit: int = 20) -> dict[str, Any]:
+        return self._json_call("team_search", {"query": query, "limit": limit})
+
+    def platform_maps(self) -> dict[str, Any]:
+        return self._json_call("platform_maps", {})
+
+    def request_unrated(
+        self,
+        opponent_team_id: str,
+        *,
+        source_match_id: str | None = None,
+        map_names: list[str] | tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        return self._json_call(
+            "request_unrated",
+            {
+                "opponent_team_id": opponent_team_id,
+                "source_match_id": source_match_id,
+                "map_names": map_names,
+            },
+        )
+
     def ladder(self, *, limit: int) -> dict[str, Any]:
         return self._json_call("ladder", {"limit": limit})
 
@@ -376,13 +472,18 @@ class UnixPlatformClient:
     def _json_call(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
         result = self._call(op, args)
         if not isinstance(result, dict):
-            raise PlatformError(502, "invalid response from FCode platform sidecar")
+            raise PlatformError(
+                502,
+                "invalid response from FCode platform sidecar",
+                outcome_unknown=op == "request_unrated",
+            )
         return result
 
     def _call(self, op: str, args: dict[str, Any]) -> dict[str, Any] | bytes:
         # Validate on both sides: local validation gives immediate feedback,
         # while server validation is the actual sandbox trust boundary.
         op, args = _validate_call(op, args)
+        request_sent = False
         try:
             deadline = time.monotonic() + self.timeout_s
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
@@ -390,6 +491,7 @@ class UnixPlatformClient:
                 peer.connect(self.socket_path)
                 _set_deadline_timeout(peer, deadline)
                 _send_frame(peer, {"op": op, "args": args}, b"")
+                request_sent = True
                 peer.shutdown(socket.SHUT_WR)
 
                 def response_body_limit(header: dict[str, Any]) -> int:
@@ -417,12 +519,27 @@ class UnixPlatformClient:
         except PlatformError:
             raise
         except (socket.timeout, TimeoutError) as exc:
-            raise PlatformError(504, "FCode platform sidecar timed out") from exc
+            raise PlatformError(
+                504,
+                "FCode platform sidecar timed out",
+                outcome_unknown=op == "request_unrated" and request_sent,
+            ) from exc
         except (OSError, _ProtocolError) as exc:
-            raise PlatformError(502, "FCode platform sidecar is unavailable") from exc
+            raise PlatformError(
+                502,
+                "FCode platform sidecar is unavailable",
+                outcome_unknown=op == "request_unrated" and request_sent,
+            ) from exc
 
         try:
-            allowed_fields = {"ok", "kind", "code", "message"}
+            allowed_fields = {
+                "ok",
+                "kind",
+                "code",
+                "message",
+                "retry_after_s",
+                "outcome_unknown",
+            }
             if "ok" not in header or set(header) - allowed_fields:
                 raise _ProtocolError("invalid RPC response fields")
             top = header
@@ -430,7 +547,9 @@ class UnixPlatformClient:
             if not isinstance(ok, bool):
                 raise _ProtocolError("RPC ok field must be a boolean")
             if not ok:
-                if set(top) != {"ok", "code", "message"} or body:
+                required = {"ok", "code", "message"}
+                error_fields = required | {"retry_after_s", "outcome_unknown"}
+                if not required <= set(top) or set(top) - error_fields or body:
                     raise _ProtocolError("invalid RPC error response")
                 code = top["code"]
                 if (
@@ -439,7 +558,22 @@ class UnixPlatformClient:
                     or not 400 <= code <= 599
                 ):
                     raise _ProtocolError("RPC error status is invalid")
-                raise PlatformError(code, _safe_error_message(top["message"]))
+                retry_after_s = top.get("retry_after_s")
+                if retry_after_s is not None and (
+                    isinstance(retry_after_s, bool)
+                    or not isinstance(retry_after_s, int)
+                    or not 0 <= retry_after_s <= _MAX_RETRY_AFTER_S
+                ):
+                    raise _ProtocolError("RPC retry delay is invalid")
+                outcome_unknown = top.get("outcome_unknown", False)
+                if not isinstance(outcome_unknown, bool):
+                    raise _ProtocolError("RPC outcome marker is invalid")
+                raise PlatformError(
+                    code,
+                    _safe_error_message(top["message"]),
+                    retry_after_s=retry_after_s,
+                    outcome_unknown=outcome_unknown,
+                )
 
             if set(top) != {"ok", "kind"}:
                 raise _ProtocolError("invalid RPC success response")
@@ -460,7 +594,9 @@ class UnixPlatformClient:
             raise
         except _ProtocolError as exc:
             raise PlatformError(
-                502, "invalid response from FCode platform sidecar"
+                502,
+                "invalid response from FCode platform sidecar",
+                outcome_unknown=op == "request_unrated" and request_sent,
             ) from exc
 
 

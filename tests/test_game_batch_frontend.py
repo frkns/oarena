@@ -28,8 +28,12 @@ def test_tagged_game_detail_loads_one_bounded_summary_page() -> None:
         "selectedRow.batch_ordinal !== selected.batch_ordinal",
         'data.tag === batchTag',
         'Number.isInteger(data.batch_ordinal)',
+        "batchReplayRows = games",
+        'if (viewerChoice === "2d") squareViewer?.prepareGames(games, id)',
     ):
         assert expected in section
+
+    assert "squareViewer?.prepareGames(batchReplayRows, id)" in section
 
 
 def test_batch_links_preserve_tag_and_do_not_duplicate_the_viewer() -> None:
@@ -60,6 +64,23 @@ def test_tagged_games_route_is_an_exact_match_result_set() -> None:
     assert 'isWebMatchTag(gameFilter.tag)' in section
 
 
+def test_games_highlight_only_rows_from_the_latest_finite_match() -> None:
+    views = (WEB / "views.js").read_text(encoding="utf-8")
+    css = (WEB / "app.css").read_text(encoding="utf-8")
+    section = views[views.index('const games = mount("games"'):views.index("/* 4. Game detail")]
+
+    assert 'isLatestMatchGame(game, latestMatchTag)' in section
+    assert '"data-latest-match": latestMatch ? "true" : null' in section
+    assert 'latest match highlighted' in section
+    assert 'page?.latest_match_tag' in section
+    assert 'ctx.on("run_started"' in section
+    assert "latestMatchRunRevision" in views
+    assert "requestRevision !== latestMatchRunRevision" in section
+    assert "const tag = startedMatchTag(payload);" in views
+    assert ".game-row.is-latest-match" in css
+    assert "background: var(--accent-soft);" in css
+
+
 def test_batch_selector_is_compact_horizontal_and_does_not_resize_viewer() -> None:
     css = (WEB / "app.css").read_text(encoding="utf-8")
     selector = css[css.index(".game-batch-selector-slot"):css.index(".viz-frame {")]
@@ -70,6 +91,21 @@ def test_batch_selector_is_compact_horizontal_and_does_not_resize_viewer() -> No
     assert "height: 28px;" in selector
     assert "block-size" not in selector
     assert "max-height" not in selector
+
+
+def test_batch_selector_names_the_winning_bot_after_side_swaps() -> None:
+    views = (WEB / "views.js").read_text(encoding="utf-8")
+    css = (WEB / "app.css").read_text(encoding="utf-8")
+    section = views[views.index("async function loadBatchSelector"):views.index("function mountViz")]
+    selector = css[css.index(".game-batch-selector-slot"):css.index(".viz-frame {")]
+
+    assert 'entry.winner === "a" || entry.winner === "b"' in section
+    assert "fmt.winner(entry)" in section
+    assert "String(entry.winner).toUpperCase()" not in section
+    assert "text: result" in section
+    assert "title: resultTitle" in section
+    assert "max-width: 18ch;" in selector
+    assert "text-overflow: ellipsis;" in selector
 
 
 def test_finite_web_match_is_armed_before_post_and_accepted_after_confirmation() -> None:
@@ -113,3 +149,23 @@ def test_completed_web_match_events_navigate_to_the_exact_tagged_game() -> None:
     assert 'batch.status === "running"' in handoff
     assert "completedRunHash(completion.tag, batch?.games)" in handoff
     assert app.count("reconcileCompletedWebMatches();") >= 2
+
+
+def test_completed_web_match_has_an_online_fallback_and_truthful_optimistic_status() -> None:
+    app = (WEB / "app.js").read_text(encoding="utf-8")
+    start = app[app.index("  async function start() {"):app.index(
+        '  tabMatch.addEventListener("click"', app.index("  async function start() {")
+    )]
+    handoff = app[app.index("const webMatchCompletions"):app.index(
+        "function setConnection("
+    )]
+
+    assert "if (!completion) scheduleWebMatchReconciliation(batchTag);" in start
+    assert "!state.online" not in start
+    assert "WEB_MATCH_RECONCILE_MIN_MS" in handoff
+    assert "WEB_MATCH_RECONCILE_MAX_MS" in handoff
+    assert 'if (batch.status === "running") {' in handoff
+    assert "retry = true;" in handoff
+    assert "stopWebMatchReconciliation(completion.tag);" in handoff
+    assert "state.status = optimisticRunStatus(state.status, optimisticRun);" in start
+    assert "state.status = { ...(state.status || {}), running: true" not in start

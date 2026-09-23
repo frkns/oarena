@@ -66,7 +66,9 @@ def _attach_log(path: str) -> None:
         os.dup2(fh.fileno(), 2)
 
 
-def _play(job: dict[str, Any]) -> tuple[dict[str, Any], str, dict[str, Any] | None]:
+def _play(
+    job: dict[str, Any],
+) -> tuple[dict[str, Any], str, dict[str, Any] | None, dict[str, Any] | None]:
     """Run one game and return its result plus exact engine provenance.
 
     Metadata capture is deliberately best-effort: an older or unusual fcode
@@ -85,7 +87,21 @@ def _play(job: dict[str, Any]) -> tuple[dict[str, Any], str, dict[str, Any] | No
     except Exception:  # metadata must never stop the engine from playing
         metadata = None
 
-    from fcode.fcode_engine import run_game
+    import fcode.fcode_engine as engine_module
+
+    run_game = engine_module.run_game
+    installed_ruleset = None
+    raw_ruleset = job.get("ruleset")
+    if raw_ruleset is not None:
+        if not isinstance(raw_ruleset, dict) or raw_ruleset.get("name") != "flow_benchmark":
+            raise ValueError("unsupported oarena worker ruleset")
+        from problems.flow_benchmark.runtime import install
+
+        installed_ruleset = install(
+            raw_ruleset,
+            fcode_module=fcode,
+            engine_module=engine_module,
+        )
 
     engine_root = str(Path(fcode.__file__).resolve().parent)
     result = run_game(
@@ -97,7 +113,12 @@ def _play(job: dict[str, Any]) -> tuple[dict[str, Any], str, dict[str, Any] | No
         int(job["seed"]),
         int(job["tle_ms"]),
     )
-    return result, version, metadata
+    ruleset_result = (
+        installed_ruleset.finish(Path(job["replay"]))
+        if installed_ruleset is not None
+        else None
+    )
+    return result, version, metadata, ruleset_result
 
 
 def main() -> int:
@@ -112,12 +133,13 @@ def main() -> int:
 
     payload: dict[str, Any]
     try:
-        result, fcode_version, fcode_metadata = _play(job)
+        result, fcode_version, fcode_metadata, ruleset_result = _play(job)
         payload = {
             "ok": True,
             "result": result,
             "fcode_version": fcode_version,
             "fcode_metadata": fcode_metadata,
+            "ruleset_result": ruleset_result,
         }
     except BaseException as exc:  # noqa: BLE001 - the result file must always be written
         payload = {

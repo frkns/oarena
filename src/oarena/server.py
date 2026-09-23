@@ -32,11 +32,13 @@ from __future__ import annotations
 import dataclasses
 import gzip
 import hashlib
+import ipaddress
 import json
 import os
 import queue
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -44,7 +46,7 @@ import time
 import traceback
 import uuid
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -52,13 +54,15 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from oarena import __version__, bots, config, maps, reporting
-from oarena.bots import BotError
+from oarena.bots import BotError, discover_names
 from oarena.config import Config, ConfigError
 from oarena.events import Event, EventBus
 from oarena.fcode_platform import FcodePlatform, PlatformError
-from oarena.league import League
+from oarena.league import MAX_GAME_SEED, MIN_GAME_SEED, League
 from oarena.maps import MapError
+from oarena.platform_history import PlatformVersionHistory
 from oarena.platform_rpc import SOCKET_ENV, UnixPlatformClient
+from oarena.platform_scrims import ScrimCoordinator
 from oarena.ratings import Rater
 from oarena.store import Bot, Store, StoreBusyError
 
@@ -85,6 +89,19 @@ LOG_TAIL_CHARS = 4000
 
 DEFAULT_GAME_LIMIT = 100
 MAX_GAME_LIMIT = 500
+
+MAX_SCRIM_MAPS = 5
+MAX_SCRIM_TARGETS = 100
+MAX_PLATFORM_NAME_CHARS = 200
+
+_SCRIM_MUTATION_PATHS = frozenset(
+    {
+        "/api/platform/scrims",
+        "/api/platform/scrims/autoscrim",
+        "/api/platform/scrims/refresh",
+    }
+)
+_TRUSTED_HOSTS_ENV = "OARENA_TRUSTED_HOSTS"
 
 _JSON_GZIP_MIN_BYTES = 1024
 """Small JSON responses cost more to compress than they save on the wire."""
@@ -124,6 +141,7 @@ _SQUARE_SPRITE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg"})
 _SQUARE_GZIP_SUFFIXES = frozenset(
     {".css", ".html", ".js", ".json", ".map", ".mjs", ".svg", ".txt"}
 )
+_WEB_REVISION_SUFFIXES = frozenset({".css", ".html", ".js", ".mjs"})
 
 _RE_GAME = re.compile(r"/games/(\d+)(?:/(replay|log))?")
 _RE_BOT = re.compile(r"/bots/([^/]+)")
@@ -157,6 +175,23 @@ class HttpError(Exception):
 
 def _web_dir() -> Path:
     return Path(__file__).resolve().parent / "web"
+
+
+def _web_revision(root: Path) -> str:
+    """Stable fingerprint of browser code that requires a page reload."""
+    digest = hashlib.sha256()
+    for path in sorted(
+        candidate
+        for candidate in root.rglob("*")
+        if candidate.is_file() and candidate.suffix.lower() in _WEB_REVISION_SUFFIXES
+    ):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        with path.open("rb") as handle:
+            while chunk := handle.read(128 * 1024):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
 
 
 def _square_visualiser_dir() -> Path:
@@ -288,12 +323,15 @@ class App:
         *,
         web_dir: Path | None = None,
         platform_client: FcodePlatform | UnixPlatformClient | None = None,
+        scrim_coordinator: ScrimCoordinator | None = None,
+        platform_history: PlatformVersionHistory | None = None,
     ) -> None:
         self.cfg = cfg
         self.store = store
         self.bus = bus
         self.league = league
         self.rater = rater
+        self.instance_id = uuid.uuid4().hex
         if platform_client is not None:
             self.platform = platform_client
         elif SOCKET_ENV in os.environ:
@@ -303,6 +341,7 @@ class App:
         else:
             self.platform = FcodePlatform()
         self.web_dir = Path(web_dir) if web_dir is not None else _web_dir()
+        self.web_revision = _web_revision(self.web_dir)
         self.square_visualiser_dir = _square_visualiser_dir()
         square_revisions = _square_visualiser_revisions(self.square_visualiser_dir)
         self.square_visualiser_revision = square_revisions.legacy
@@ -313,6 +352,23 @@ class App:
             self.fcode_version: str | None = config.check_fcode()
         except RuntimeError:
             self.fcode_version = None
+        self.scrims = (
+            scrim_coordinator
+            if scrim_coordinator is not None
+            else ScrimCoordinator(
+                cfg.state_dir / "platform-scrims.db",
+                self.platform,
+                bus=bus,
+            )
+        )
+        self.platform_history = (
+            platform_history
+            if platform_history is not None
+            else PlatformVersionHistory(
+                cfg.state_dir / "platform-history.db",
+                self.platform,
+            )
+        )
 
     @property
     def viz_dir(self) -> Path | None:
@@ -346,11 +402,11 @@ class App:
         rater = Rater(cfg.trueskill)
         try:
             store.ensure_rating_config(cfg.trueskill)
+            league = League(cfg, store, bus, rater)
+            return cls(cfg, store, bus, league, rater)
         except BaseException:
             store.close()
             raise
-        league = League(cfg, store, bus, rater)
-        return cls(cfg, store, bus, league, rater)
 
     def close(self) -> None:
         """Abort an active run, reap its workers, then close the database.
@@ -361,6 +417,18 @@ class App:
         connection), so shutdown uses the same immediate cancellation path as
         the dashboard's Force stop action.
         """
+        # Both platform helpers own a small database and may currently be
+        # waiting on the credentialed sidecar. Stop their workers before any
+        # application database is closed.
+        try:
+            self.platform_history.close()
+        except Exception:  # pragma: no cover - shutdown remains best-effort
+            pass
+        try:
+            self.scrims.close()
+        except Exception:  # pragma: no cover - shutdown remains best-effort
+            pass
+
         reaped = False
         try:
             # A reload is a source-version boundary, not a played game. Do not
@@ -401,6 +469,10 @@ class App:
             "mirror": cfg.mirror,
             "seed_policy": cfg.seed_policy,
             "seed": cfg.seed,
+            # JSON numbers lose integer precision in browsers above 2**53 - 1.
+            # Keep the numeric field for API compatibility and expose an exact
+            # decimal for controls that must reproduce a configured seed.
+            "seed_exact": str(cfg.seed),
             "coinflip_is_draw": cfg.coinflip_is_draw,
             "replay_budget_mb": cfg.replay_budget_mb,
             "sigma_reinflate": cfg.sigma_reinflate,
@@ -415,6 +487,14 @@ class App:
             self.store,
             maps.discover(self.cfg.maps_dir, self.cfg.extra_maps_dir),
         )
+
+    def ladder_json(self, rows: Sequence[reporting.LadderRow]) -> list[dict[str, Any]]:
+        """Ladder rows annotated against this project's current bot catalog."""
+        present = set(discover_names(self.cfg.bots_dir))
+        payload = reporting.ladder_json(rows)
+        for row in payload:
+            row["source_present"] = row["name"] in present
+        return payload
 
     def storage_json(self) -> dict[str, Any]:
         """Disk use for the dashboard's space-management view."""
@@ -504,6 +584,273 @@ def _only_query(query: dict[str, list[str]], allowed: set[str]) -> None:
         raise HttpError(400, f"unsupported query parameter(s): {rendered}")
 
 
+def _unavailable_version_tracking() -> dict[str, Any]:
+    return {
+        "started": False,
+        "syncing": False,
+        "refreshing": False,
+        "due": False,
+        "initialized": False,
+        "initial_sync_complete": False,
+        "last_sync_at": None,
+        "last_attempt_at": None,
+        "next_refresh_at": None,
+        "last_error": "Version tracking is unavailable",
+        "error": "Version tracking is unavailable",
+    }
+
+
+def _only_body(
+    payload: dict[str, Any],
+    *,
+    allowed: set[str],
+    required: set[str] | None = None,
+) -> None:
+    """Require an exact, deliberately small JSON request shape."""
+
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        rendered = ", ".join(repr(key) for key in unknown)
+        raise HttpError(400, f"unsupported request field(s): {rendered}")
+    missing = sorted((required or set()) - set(payload))
+    if missing:
+        rendered = ", ".join(repr(key) for key in missing)
+        raise HttpError(400, f"missing request field(s): {rendered}")
+
+
+def _http_authority(value: str) -> tuple[str, int | None] | None:
+    """Parse a Host-style authority without accepting URL syntax or controls."""
+
+    if not value or value != value.strip():
+        return None
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError:
+        return None
+    if any(char.isspace() or ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        return None
+    parsed = urlsplit(f"//{value}")
+    if (
+        not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.hostname is None
+        or parsed.netloc.endswith(":")
+    ):
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    hostname = parsed.hostname.rstrip(".").lower()
+    return (hostname, port) if hostname else None
+
+
+def _trusted_mutation_host(hostname: str, port: int | None) -> bool:
+    """Allow non-rebindable local/Tailscale hosts and explicit proxy hosts."""
+
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        # Literal addresses cannot be swapped by DNS rebinding. Oarena still
+        # warns against binding its unauthenticated server to a network.
+        return True
+
+    local_names = {
+        name.rstrip(".").lower()
+        for name in (socket.gethostname(), socket.getfqdn())
+        if name
+    }
+    if (
+        hostname == "localhost"
+        or hostname.endswith(".localhost")
+        or hostname in local_names
+        or hostname.endswith(".ts.net")
+    ):
+        return True
+
+    for configured in os.environ.get(_TRUSTED_HOSTS_ENV, "").split(","):
+        authority = _http_authority(configured.strip())
+        if authority is None:
+            continue
+        configured_host, configured_port = authority
+        if hostname == configured_host and (
+            configured_port is None or configured_port == port
+        ):
+            return True
+    return False
+
+
+def _bounded_text(
+    value: Any,
+    name: str,
+    *,
+    limit: int,
+    optional: bool = False,
+) -> str | None:
+    if value is None and optional:
+        return None
+    if not isinstance(value, str):
+        raise HttpError(400, f"{name!r} must be a string")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise HttpError(400, f"{name!r} must be valid UTF-8 text") from exc
+    if any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value):
+        raise HttpError(400, f"{name!r} contains unsupported control characters")
+    text = value.strip()
+    if not text or len(text) > limit:
+        raise HttpError(400, f"{name!r} must contain 1 to {limit} characters")
+    return text
+
+
+def _body_uuid(
+    payload: dict[str, Any], key: str, *, optional: bool = False
+) -> str | None:
+    if key not in payload or payload[key] is None:
+        if optional:
+            return None
+        raise HttpError(400, f"{key!r} is required")
+    value = payload[key]
+    if not isinstance(value, str):
+        raise HttpError(400, f"{key!r} must be a canonical UUID")
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError as exc:
+        raise HttpError(400, f"{key!r} must be a canonical UUID") from exc
+    if value != str(parsed):
+        raise HttpError(400, f"{key!r} must be a canonical UUID")
+    return value
+
+
+def _body_map_names(payload: dict[str, Any]) -> tuple[str, ...]:
+    if "map_names" not in payload or payload["map_names"] is None:
+        return ()
+    raw = payload["map_names"]
+    if not isinstance(raw, list):
+        raise HttpError(400, "'map_names' must be a list of strings")
+    if len(raw) > MAX_SCRIM_MAPS:
+        raise HttpError(400, f"'map_names' may contain at most {MAX_SCRIM_MAPS} maps")
+    names: list[str] = []
+    for value in raw:
+        name = _bounded_text(
+            value,
+            "map_names",
+            limit=MAX_PLATFORM_NAME_CHARS,
+        )
+        assert name is not None
+        if name in names:
+            raise HttpError(400, "'map_names' must not contain duplicates")
+        names.append(name)
+    return tuple(names)
+
+
+def _body_target_ids(payload: dict[str, Any]) -> tuple[str, ...]:
+    if "target_team_ids" not in payload or payload["target_team_ids"] is None:
+        return ()
+    raw = payload["target_team_ids"]
+    if not isinstance(raw, list):
+        raise HttpError(400, "'target_team_ids' must be a list of canonical UUIDs")
+    if len(raw) > MAX_SCRIM_TARGETS:
+        raise HttpError(
+            400,
+            f"'target_team_ids' may contain at most {MAX_SCRIM_TARGETS} teams",
+        )
+    target_ids: list[str] = []
+    for value in raw:
+        if not isinstance(value, str):
+            raise HttpError(400, "'target_team_ids' must contain canonical UUIDs")
+        try:
+            parsed = uuid.UUID(value)
+        except ValueError as exc:
+            raise HttpError(
+                400, "'target_team_ids' must contain canonical UUIDs"
+            ) from exc
+        if value != str(parsed):
+            raise HttpError(400, "'target_team_ids' must contain canonical UUIDs")
+        if value in target_ids:
+            raise HttpError(400, "'target_team_ids' must not contain duplicates")
+        target_ids.append(value)
+    return tuple(target_ids)
+
+
+def _body_target_names(
+    payload: dict[str, Any], target_ids: tuple[str, ...]
+) -> dict[str, str] | None:
+    raw = payload.get("target_team_names")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise HttpError(400, "'target_team_names' must be an object keyed by team ID")
+    if len(raw) > MAX_SCRIM_TARGETS:
+        raise HttpError(
+            400,
+            f"'target_team_names' may contain at most {MAX_SCRIM_TARGETS} teams",
+        )
+    target_set = set(target_ids)
+    names: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str):  # JSON itself guarantees this, for direct tests.
+            raise HttpError(400, "'target_team_names' keys must be canonical UUIDs")
+        try:
+            parsed = uuid.UUID(key)
+        except ValueError as exc:
+            raise HttpError(
+                400, "'target_team_names' keys must be canonical UUIDs"
+            ) from exc
+        if key != str(parsed) or key not in target_set:
+            raise HttpError(
+                400,
+                "'target_team_names' keys must name selected target_team_ids",
+            )
+        name = _bounded_text(
+            value,
+            "target_team_names",
+            limit=MAX_PLATFORM_NAME_CHARS,
+        )
+        assert name is not None
+        names[key] = name
+    return names
+
+
+def _body_bounded_int(
+    payload: dict[str, Any], key: str, default: int, *, low: int, high: int
+) -> int:
+    value = payload.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HttpError(400, f"{key!r} must be an integer")
+    if not low <= value <= high:
+        raise HttpError(400, f"{key!r} must be between {low} and {high}")
+    return value
+
+
+def _qs_bounded_int(
+    query: dict[str, list[str]], key: str, default: int, *, low: int, high: int
+) -> int:
+    value = _qs_int(query, key, default)
+    if not low <= value <= high:
+        raise HttpError(400, f"{key!r} must be between {low} and {high}")
+    return value
+
+
+def _scrim_validation_error(exc: ValueError) -> HttpError:
+    """Turn coordinator input rejection into a bounded browser-safe 400."""
+
+    text = str(exc).strip()
+    if (
+        not text
+        or len(text) > 300
+        or any(ord(char) < 0x20 and char not in "\t" for char in text)
+    ):
+        text = "invalid scrim request"
+    return HttpError(400, text)
+
+
 def _qs_uuid(query: dict[str, list[str]], key: str) -> str | None:
     text = _qs_str(query, key)
     if text is None:
@@ -532,17 +879,31 @@ def _body_bool(payload: dict[str, Any], key: str, default: bool) -> bool:
     raise HttpError(400, f"{key!r} must be true or false, got {value!r}")
 
 
+def _parsed_body_int(value: Any, key: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise HttpError(400, f"{key!r} must be an integer, got {value!r}")
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise HttpError(400, f"{key!r} must be an integer, got {value!r}") from exc
+
+
 def _body_int(payload: dict[str, Any], key: str, default: int, *, minimum: int = 0) -> int:
     value = payload.get(key, default)
     if value is None:
         return default
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise HttpError(400, f"{key!r} must be an integer, got {value!r}")
-    try:
-        number = int(value)
-    except ValueError as exc:
-        raise HttpError(400, f"{key!r} must be an integer, got {value!r}") from exc
+    number = _parsed_body_int(value, key)
     return max(minimum, number)
+
+
+def _body_seed(payload: dict[str, Any], key: str) -> int:
+    number = _parsed_body_int(payload.get(key), key)
+    if not MIN_GAME_SEED <= number <= MAX_GAME_SEED:
+        raise HttpError(
+            400,
+            f"{key!r} must be between {MIN_GAME_SEED} and {MAX_GAME_SEED}",
+        )
+    return number
 
 
 def _body_str(payload: dict[str, Any], key: str) -> str:
@@ -648,6 +1009,11 @@ class Handler(BaseHTTPRequestHandler):
             self._fail(400, "malformed request URI")
             return
         try:
+            if (
+                self.command == "POST"
+                and path.rstrip("/") in _SCRIM_MUTATION_PATHS
+            ):
+                self._require_scrim_mutation_headers()
             payload = {} if self.command == "GET" else self._read_body()
             route(path, query, payload)
         except HttpError as exc:
@@ -663,6 +1029,67 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # a bug in oarena, not in the request
             traceback.print_exc()
             self._fail(500, f"{type(exc).__name__}: {exc}")
+
+    def _require_scrim_mutation_headers(self) -> None:
+        """Reject browser cross-site/rebinding writes before reading their body."""
+
+        def reject(code: int, message: str) -> None:
+            # The body has deliberately not been consumed, so this connection
+            # cannot safely carry another HTTP request after the error response.
+            self.close_connection = True
+            raise HttpError(code, message)
+
+        content_types = self.headers.get_all("Content-Type", failobj=[])
+        if len(content_types) != 1:
+            reject(415, "scrim mutations require Content-Type: application/json")
+        media_type = content_types[0].split(";", 1)[0].strip().lower()
+        if media_type != "application/json":
+            reject(415, "scrim mutations require Content-Type: application/json")
+
+        hosts = self.headers.get_all("Host", failobj=[])
+        if len(hosts) != 1:
+            reject(403, "forbidden request origin")
+        authority = _http_authority(hosts[0])
+        if authority is None or not _trusted_mutation_host(*authority):
+            reject(403, "forbidden request origin")
+        hostname, host_port = authority
+
+        forwarded = self.headers.get_all("X-Forwarded-Proto", failobj=[])
+        if len(forwarded) > 1:
+            reject(403, "forbidden request origin")
+        scheme = forwarded[0].strip().lower() if forwarded else "http"
+        if scheme not in {"http", "https"}:
+            reject(403, "forbidden request origin")
+
+        origins = self.headers.get_all("Origin", failobj=[])
+        if len(origins) != 1:
+            reject(403, "forbidden request origin")
+        try:
+            origin = urlsplit(origins[0])
+            origin_port = origin.port
+        except ValueError:
+            reject(403, "forbidden request origin")
+        if (
+            origin.scheme.lower() != scheme
+            or origin.username is not None
+            or origin.password is not None
+            or origin.hostname is None
+            or origin.path
+            or origin.query
+            or origin.fragment
+        ):
+            reject(403, "forbidden request origin")
+        origin_hostname = origin.hostname.rstrip(".").lower()
+        default_port = 443 if scheme == "https" else 80
+        effective_origin_port = (
+            origin_port if origin_port is not None else default_port
+        )
+        effective_host_port = host_port if host_port is not None else default_port
+        if (
+            origin_hostname != hostname
+            or effective_origin_port != effective_host_port
+        ):
+            reject(403, "forbidden request origin")
 
     def _read_body(self) -> dict[str, Any]:
         """Read and JSON-decode the request body; an empty body is ``{}``."""
@@ -842,8 +1269,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._api_platform_matches(query)
         if route == "/platform/ladder":
             return self._api_platform_ladder(query)
+        if route == "/platform/version-history":
+            return self._api_platform_version_history(query)
+        if route == "/platform/version-history/games":
+            return self._api_platform_version_run_games(query)
+        if route == "/platform/version-history/match":
+            return self._api_platform_version_match_runs(query)
+        if route == "/platform/version-tracking":
+            return self._api_platform_version_tracking(query)
         if route == "/platform/test-runs":
             return self._api_platform_test_runs(query)
+        if route == "/platform/scrims":
+            return self._api_platform_scrims(query)
+        if route == "/platform/teams":
+            return self._api_platform_teams(query)
+        if route == "/platform/maps":
+            return self._api_platform_maps(query)
 
         platform_replay = _RE_PLATFORM_REPLAY.fullmatch(route)
         if platform_replay is not None:
@@ -913,15 +1354,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send(503, body, "text/html; charset=utf-8",
                        headers={"Cache-Control": _NO_STORE})
             return
-        # Theme is project configuration, rather than origin-local browser
-        # storage: users often restart `oarena serve` on a different free port.
-        # Stamp it into the first response so there is no light/dark flash.
+        # Stamp the project fallback into the response. A tiny inline script
+        # applies this browser origin's saved preference before CSS loads.
         try:
             body = index.read_text(encoding="utf-8")
         except OSError as exc:
             raise HttpError(500, f"cannot read dashboard: {exc}") from exc
         body = body.replace(
             'data-theme="dark"', f'data-theme="{self.app.cfg.ui_theme}"', 1
+        )
+        body = body.replace(
+            '<meta charset="utf-8">',
+            '<meta charset="utf-8">\n'
+            f'<meta name="oarena-web-revision" content="{self.app.web_revision}">',
+            1,
         )
         self._send(
             200,
@@ -1432,21 +1878,34 @@ canvas[data-oarena-keyboard-map="true"]:focus-visible {
             len(cursor) > 2048 or any(ord(char) < 0x20 for char in cursor)
         ):
             raise HttpError(400, "'cursor' is invalid")
-        self._json(
-            self.app.platform.matches(
-                limit=limit,
-                match_type=match_type,
-                mine=mine,
-                team_id=team_id,
-                cursor=cursor,
-            )
+        result = self.app.platform.matches(
+            limit=limit,
+            match_type=match_type,
+            mine=mine,
+            team_id=team_id,
+            cursor=cursor,
         )
+        try:
+            self.app.platform_history.observe_matches(result.get("matches"))
+        except Exception:
+            # Version history is auxiliary; never hide a valid platform result
+            # because its local cache is unavailable.
+            pass
+        self._json(result)
 
     def _api_platform_match(
         self, match_id: str, query: dict[str, list[str]]
     ) -> None:
         _only_query(query, set())
-        self._json(self.app.platform.match(match_id))
+        result = self.app.platform.match(match_id)
+        match = result.get("match")
+        try:
+            self.app.platform_history.observe_matches(
+                [match] if match is not None else []
+            )
+        except Exception:
+            pass
+        self._json(result)
 
     def _api_platform_replay(
         self, match_id: str, game: int, query: dict[str, list[str]]
@@ -1469,12 +1928,157 @@ canvas[data-oarena-keyboard-map="true"]:focus-visible {
     def _api_platform_ladder(self, query: dict[str, list[str]]) -> None:
         _only_query(query, {"limit"})
         limit = max(1, min(100, _qs_int(query, "limit", 50)))
-        self._json(self.app.platform.ladder(limit=limit))
+        try:
+            tracking = self.app.platform_history.request_refresh(
+                platform=self.app.platform
+            )
+        except Exception:
+            tracking = _unavailable_version_tracking()
+        result = self.app.platform.ladder(limit=limit)
+        try:
+            result = self.app.platform_history.enrich_ladder(result)
+        except Exception:
+            result = dict(result)
+            tracking = {
+                **tracking,
+                "last_error": "Version tracking is unavailable",
+                "error": "Version tracking is unavailable",
+            }
+        result["version_tracking"] = tracking
+        self._json(result)
+
+    def _api_platform_version_tracking(
+        self, query: dict[str, list[str]]
+    ) -> None:
+        """Report local sync progress without refetching the public ladder."""
+
+        _only_query(query, set())
+        try:
+            status = self.app.platform_history.status()
+        except Exception:
+            status = _unavailable_version_tracking()
+        else:
+            try:
+                # Paging progress is extra detail about a sync that is already
+                # reported; losing it must not turn a healthy status into an
+                # "unavailable" one.
+                status = {
+                    **status,
+                    "backfill": self.app.platform_history.backfill_state(),
+                }
+            except Exception:
+                pass
+        self._json(status)
+
+    def _api_platform_version_history(
+        self, query: dict[str, list[str]]
+    ) -> None:
+        """Return the local observed version timeline without polling FCode."""
+
+        _only_query(query, {"limit", "team_id"})
+        limit = max(1, min(200, _qs_int(query, "limit", 100)))
+        team_id = _qs_uuid(query, "team_id")
+        try:
+            result = self.app.platform_history.history(
+                team_id=team_id,
+                limit=limit,
+            )
+        except Exception as exc:
+            raise HttpError(503, "Version tracking is unavailable") from exc
+        self._json(result)
+
+    def _api_platform_version_run_games(
+        self, query: dict[str, list[str]]
+    ) -> None:
+        """Return the matches observed during one team-version run."""
+
+        _only_query(query, {"team_id", "ordinal", "limit"})
+        team_id = _qs_uuid(query, "team_id")
+        if team_id is None:
+            raise HttpError(400, "'team_id' is required")
+        ordinal = _qs_bounded_int(query, "ordinal", 0, low=0, high=100_000)
+        limit = _qs_bounded_int(query, "limit", 500, low=1, high=500)
+        try:
+            result = self.app.platform_history.run_games(
+                team_id=team_id,
+                ordinal=ordinal,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HttpError(400, str(exc)) from exc
+        except Exception as exc:
+            raise HttpError(503, "Version tracking is unavailable") from exc
+        self._json(result)
+
+    def _api_platform_version_match_runs(
+        self, query: dict[str, list[str]]
+    ) -> None:
+        """Report the version each team played in one match, from local records."""
+
+        _only_query(query, {"match_id"})
+        match_id = _qs_uuid(query, "match_id")
+        if match_id is None:
+            raise HttpError(400, "'match_id' is required")
+        try:
+            result = self.app.platform_history.match_runs(match_id=match_id)
+        except ValueError as exc:
+            raise HttpError(400, str(exc)) from exc
+        except Exception as exc:
+            raise HttpError(503, "Version tracking is unavailable") from exc
+        self._json(result)
 
     def _api_platform_test_runs(self, query: dict[str, list[str]]) -> None:
         _only_query(query, {"limit"})
         limit = max(1, min(100, _qs_int(query, "limit", 50)))
         self._json(self.app.platform.test_runs(limit=limit))
+
+    def _api_platform_scrims(self, query: dict[str, list[str]]) -> None:
+        """Return only durable local scrim state; this route never polls FCode."""
+
+        _only_query(query, {"limit", "our_version"})
+        limit = _qs_bounded_int(query, "limit", 100, low=1, high=200)
+        raw_version = _one(query, "our_version")
+        our_version: str | int | None
+        if raw_version is None:
+            our_version = None
+        elif raw_version == "current":
+            our_version = "current"
+        else:
+            try:
+                parsed = int(raw_version)
+            except (TypeError, ValueError) as exc:
+                raise HttpError(
+                    400, "'our_version' must be 'current' or a positive integer"
+                ) from exc
+            if parsed <= 0 or parsed > 2_147_483_647 or str(parsed) != raw_version:
+                raise HttpError(
+                    400, "'our_version' must be 'current' or a positive integer"
+                )
+            our_version = parsed
+        try:
+            snapshot = self.app.scrims.snapshot(
+                limit=limit,
+                our_version=our_version,
+            )
+        except ValueError as exc:
+            raise _scrim_validation_error(exc) from exc
+        self._json(snapshot)
+
+    def _api_platform_teams(self, query: dict[str, list[str]]) -> None:
+        _only_query(query, {"q", "limit"})
+        raw_query = _one(query, "q")
+        search = _bounded_text(
+            raw_query,
+            "q",
+            limit=MAX_PLATFORM_NAME_CHARS,
+        )
+        assert search is not None
+        limit = _qs_bounded_int(query, "limit", 20, low=1, high=20)
+        self._json(self.app.platform.team_search(search, limit=limit))
+
+    def _api_platform_maps(self, query: dict[str, list[str]]) -> None:
+        _only_query(query, set())
+        self._json(self.app.platform.platform_maps())
 
     def _api_state(self) -> None:
         app = self.app
@@ -1487,7 +2091,7 @@ canvas[data-oarena-keyboard-map="true"]:focus-visible {
             {
                 "config": app.config_json(),
                 "status": app.league.status,
-                "ladder": reporting.ladder_json(rows),
+                "ladder": app.ladder_json(rows),
                 "maps": maps_json,
                 "counts": {
                     "bots": len(rows),
@@ -1496,6 +2100,8 @@ canvas[data-oarena-keyboard-map="true"]:focus-visible {
                 },
                 "fcode": app.fcode_version,
                 "seq": seq,
+                "instance": app.instance_id,
+                "web_revision": app.web_revision,
             }
         )
 
@@ -1504,7 +2110,7 @@ canvas[data-oarena-keyboard-map="true"]:focus-visible {
         # the full catalog for the Bots administration view; `?all=1` remains
         # available to callers that explicitly need disabled entries.
         rows = reporting.ladder(self.app.store, include_inactive=_qs_bool(query, "all", False))
-        self._json(reporting.ladder_json(rows))
+        self._json(self.app.ladder_json(rows))
 
     def _api_matrix(self, query: dict[str, list[str]]) -> None:
         store = self.app.store
@@ -1560,7 +2166,13 @@ canvas[data-oarena-keyboard-map="true"]:focus-visible {
             if _qs_bool(query, "summary")
             else reporting.game_json
         )
-        self._json({"games": [serializer(g) for g in games], "next": nxt})
+        self._json(
+            {
+                "games": [serializer(g) for g in games],
+                "next": nxt,
+                "latest_match_tag": self.app.store.latest_match_tag(),
+            }
+        )
 
     def _api_batch(self, query: dict[str, list[str]]) -> None:
         """Return one immutable run and its games in submitted plan order."""
@@ -1693,7 +2305,16 @@ canvas[data-oarena-keyboard-map="true"]:focus-visible {
                 # below has been replayed, and an id here would move its
                 # Last-Event-ID past events it has never seen.
                 self._frame(
-                    Event(seq=current, ts=time.time(), type="hello", data={"seq": current}),
+                    Event(
+                        seq=current,
+                        ts=time.time(),
+                        type="hello",
+                        data={
+                            "seq": current,
+                            "instance": self.app.instance_id,
+                            "web_revision": self.app.web_revision,
+                        },
+                    ),
                     with_id=False,
                 )
                 highest = since
@@ -1737,6 +2358,12 @@ canvas[data-oarena-keyboard-map="true"]:focus-visible {
             return self._post_match(payload)
         if route == "/arena":
             return self._post_arena(payload)
+        if route == "/platform/scrims":
+            return self._post_platform_scrim(payload)
+        if route == "/platform/scrims/autoscrim":
+            return self._post_platform_autoscrim(payload)
+        if route == "/platform/scrims/refresh":
+            return self._post_platform_scrim_refresh(payload)
         if route == "/stop":
             force = _body_bool(payload, "force", False)
             killed = self.app.league.force_stop() if force else 0
@@ -1795,19 +2422,45 @@ canvas[data-oarena-keyboard-map="true"]:focus-visible {
         mirror_raw = payload.get("mirror")
         mirror = None if mirror_raw is None else _body_bool(payload, "mirror", True)
         tag = _body_str(payload, "tag") or None
+        repeat = _parsed_body_int(payload.get("repeat", 1), "repeat")
+        if not 1 <= repeat <= 500:
+            raise HttpError(400, "'repeat' must be between 1 and 500")
+        seed_policy_raw = _body_str(payload, "seed_policy").lower()
+        seed_policy = seed_policy_raw or None
+        if seed_policy not in {None, "fixed", "random"}:
+            raise HttpError(400, "'seed_policy' must be 'random' or 'fixed'")
+        if seed_policy is None and payload.get("seed") is not None:
+            raise HttpError(400, "'seed_policy' is required when 'seed' is provided")
+        seed: int | None = None
+        if seed_policy == "fixed":
+            if payload.get("seed") is None:
+                raise HttpError(400, "'seed' is required for a fixed seed policy")
+            seed = _body_seed(payload, "seed")
+            if seed + repeat - 1 > MAX_GAME_SEED:
+                raise HttpError(
+                    400,
+                    f"'seed' plus {repeat} rounds exceeds {MAX_GAME_SEED}",
+                )
+        elif seed_policy == "random" and payload.get("seed") is not None:
+            raise HttpError(400, "a random seed policy cannot include 'seed'")
         # Resolve up front so a typo answers 400 rather than queueing games that
         # can only fail (this also syncs a bot that appeared since the last scan).
         self.app.league.resolve(a)
         self.app.league.resolve(b)
-        jobs = self.app.league.plan_match(
-            a,
-            b,
-            maps=_body_names(payload, "maps"),
-            repeat=max(1, _body_int(payload, "repeat", 1, minimum=1)),
-            mirror=mirror,
-            rated=_body_bool(payload, "rated", True),
-            tag=tag or "match",
-        )
+        try:
+            jobs = self.app.league.plan_match(
+                a,
+                b,
+                maps=_body_names(payload, "maps"),
+                repeat=repeat,
+                mirror=mirror,
+                rated=_body_bool(payload, "rated", True),
+                tag=tag or "match",
+                seed_policy=seed_policy,
+                seed=seed,
+            )
+        except ValueError as exc:
+            raise HttpError(400, str(exc)) from exc
         if not jobs:
             raise HttpError(400, "that match plans zero games")
         label = _body_str(payload, "label") or f"{a} vs {b}"
@@ -1833,15 +2486,103 @@ canvas[data-oarena-keyboard-map="true"]:focus-visible {
         top = _body_int(payload, "top", 0, minimum=0)
         rated = _body_bool(payload, "rated", True)
         tag = _body_str(payload, "tag") or None
-        self._start(
-            lambda: self.app.league.start_arena(
-                kind, top=top, target=target, rated=rated, batch_tag=tag
+        try:
+            self._start(
+                lambda: self.app.league.start_arena(
+                    kind, top=top, target=target, rated=rated, batch_tag=tag
+                )
             )
-        )
+        except ValueError as exc:
+            raise HttpError(400, str(exc)) from exc
         response: dict[str, Any] = {"ok": True}
         if tag is not None:
             response["tag"] = tag
         self._json(response, code=202)
+
+    def _post_platform_scrim(self, payload: dict[str, Any]) -> None:
+        _only_body(
+            payload,
+            allowed={
+                "request_key",
+                "opponent_team_id",
+                "opponent_team_name",
+                "source_match_id",
+                "map_names",
+            },
+            required={"request_key", "opponent_team_id"},
+        )
+        request_key = _body_uuid(payload, "request_key")
+        opponent_team_id = _body_uuid(payload, "opponent_team_id")
+        opponent_team_name = _bounded_text(
+            payload.get("opponent_team_name"),
+            "opponent_team_name",
+            limit=MAX_PLATFORM_NAME_CHARS,
+            optional=True,
+        )
+        source_match_id = _body_uuid(payload, "source_match_id", optional=True)
+        map_names = _body_map_names(payload)
+        assert request_key is not None and opponent_team_id is not None
+        try:
+            request = self.app.scrims.enqueue_manual(
+                request_key,
+                opponent_team_id,
+                opponent_team_name=opponent_team_name,
+                source_match_id=source_match_id,
+                map_names=map_names,
+            )
+        except ValueError as exc:
+            raise _scrim_validation_error(exc) from exc
+        self._json({"request": request}, code=202)
+
+    def _post_platform_autoscrim(self, payload: dict[str, Any]) -> None:
+        _only_body(
+            payload,
+            allowed={
+                "enabled",
+                "target_team_ids",
+                "target_team_names",
+                "target_matches_per_version",
+                "map_names",
+            },
+            required={"enabled"},
+        )
+        enabled = _body_bool(payload, "enabled", False)
+        if not enabled and set(payload) == {"enabled"}:
+            try:
+                settings = self.app.scrims.disable_autoscrim()
+            except ValueError as exc:
+                raise _scrim_validation_error(exc) from exc
+            self._json({"settings": settings})
+            return
+        target_ids = _body_target_ids(payload)
+        target_names = _body_target_names(payload, target_ids)
+        target_matches = _body_bounded_int(
+            payload,
+            "target_matches_per_version",
+            0,
+            low=0,
+            high=100,
+        )
+        map_names = _body_map_names(payload)
+        try:
+            settings = self.app.scrims.configure_autoscrim(
+                enabled,
+                target_team_ids=target_ids,
+                target_team_names=target_names,
+                target_matches_per_version=target_matches,
+                map_names=map_names,
+            )
+        except ValueError as exc:
+            raise _scrim_validation_error(exc) from exc
+        self._json({"settings": settings})
+
+    def _post_platform_scrim_refresh(self, payload: dict[str, Any]) -> None:
+        _only_body(payload, allowed=set())
+        try:
+            self.app.scrims.refresh()
+        except ValueError as exc:
+            raise _scrim_validation_error(exc) from exc
+        self._json({"ok": True}, code=202)
 
     def _post_recompute(self) -> None:
         self._busy()
@@ -2130,7 +2871,17 @@ def serve(
 ) -> None:
     """Run the dashboard until Ctrl-C, then stop the league and close cleanly."""
     app = App.create(cfg, workers=workers)
-    app.league.sync()
+    try:
+        app.league.sync()
+    except StoreBusyError as exc:
+        # Another oarena process holds the arena's single-writer lease -- a
+        # match run, usually. Syncing the bot catalog is the only thing that
+        # needs it here, and `League.sync` is explicitly safe to run beside a
+        # live run; it is the coarse arena-wide lease it cannot get. Serving a
+        # slightly stale catalog beats refusing to start, which took the whole
+        # dashboard down for the length of someone else's sweep every time a
+        # bot edit tripped the reloader.
+        print(f"warning: bot catalog not synced — {exc}", flush=True)
     try:
         httpd = make_server(app, host, port, strict_port=strict_port)
     except OSError as exc:

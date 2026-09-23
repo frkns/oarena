@@ -748,6 +748,10 @@ class Store:
                 and {
                     "idx_games_batch_ordinal",
                     "idx_games_tag",
+                    # Listed here so an existing database actually gains them:
+                    # this check short-circuits the migration entirely.
+                    "idx_games_side_a",
+                    "idx_games_side_b",
                 } <= indexes
             )
             if current:
@@ -783,6 +787,22 @@ class Store:
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_games_batch_ordinal "
                     "ON games(tag, batch_ordinal) "
                     "WHERE tag <> '' AND batch_ordinal IS NOT NULL"
+                )
+                # Created here, after the columns above exist: every per-bot
+                # ladder query scopes on `(a = ? OR b = ?)`, and indexing the A
+                # side alone left the B branch unindexed, which defeats the OR
+                # and full-scans `games` -- 508 bots x 3 queries turned one
+                # ladder read into 25 seconds. Each carries every column those
+                # queries read, so they never fetch the row either:
+                # `fcode_metadata_json` makes the average row 4KB, worth another
+                # 0.8s across a full ladder.
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_games_side_a "
+                    "ON games(a, a_src_hash, winner, rated, a_errors, b, ts)"
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_games_side_b "
+                    "ON games(b, b_src_hash, winner, rated, b_errors, a, ts)"
                 )
                 self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 self._conn.commit()
@@ -1154,6 +1174,21 @@ class Store:
             "SELECT * FROM game_batches WHERE tag = ?", (tag,)
         ).fetchone()
         return dict(row) if row is not None else None
+
+    @_locked
+    def latest_match_tag(self) -> str | None:
+        """Tag of the most recently reserved finite match, including an empty one.
+
+        Arena/vs batches do not replace this marker. Returning an empty match is
+        deliberate: if the newest match stored no games, the Games view should
+        highlight nothing rather than make an older match look current.
+        """
+
+        row = self._conn.execute(
+            "SELECT tag FROM game_batches WHERE mode = 'match' "
+            "ORDER BY started DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        return str(row["tag"]) if row is not None else None
 
     def ensure_rating_config(self, cfg: TrueSkillConfig) -> None:
         """Persist and verify the TrueSkill environment used by this ladder."""

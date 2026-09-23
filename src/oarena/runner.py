@@ -131,6 +131,7 @@ class GameSpec:
     cwd: Path
     tmp_dir: Path
     python_dont_write_bytecode: bool = False
+    ruleset: dict[str, Any] | None = None
 
 
 @dataclass
@@ -163,6 +164,7 @@ class GameOutcome:
     log_tail: str = ""
     fcode_version: str = ""
     fcode_metadata: dict[str, Any] | None = None
+    ruleset_result: dict[str, Any] | None = None
 
     @property
     def ok(self) -> bool:
@@ -314,6 +316,7 @@ def _supervise(
         "seed": int(spec.seed),
         "tle_ms": int(spec.tle_ms),
         "cwd": str(spec.cwd),
+        "ruleset": spec.ruleset,
     }
 
     proc = subprocess.Popen(
@@ -348,6 +351,8 @@ def _supervise(
         payload = _read_result(result_path)
         log_text = _merge_payload_traceback(log_path, log_text, payload)
         fcode_version, fcode_metadata = _worker_fcode_provenance(payload)
+        raw_ruleset = payload.get("ruleset_result") if payload else None
+        ruleset_result = raw_ruleset if isinstance(raw_ruleset, dict) else None
 
         engine: dict[str, Any] | None = None
         if timed_out:
@@ -390,6 +395,7 @@ def _supervise(
             b=PlayerResult(errors=b_errors),
             fcode_version=fcode_version,
             fcode_metadata=fcode_metadata,
+            ruleset_result=ruleset_result,
         )
         if engine is not None:
             _apply_engine_result(outcome, engine)

@@ -8,7 +8,15 @@
 <title>oarena</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.ico">
 
-<!-- The server stamps data-theme from this project's oarena.toml before paint. -->
+<!-- The server supplies a default; the browser preference wins before paint. -->
+<script>
+try {
+  const savedTheme = localStorage.getItem("oarena-theme");
+  if (savedTheme === "dark" || savedTheme === "light") {
+    document.documentElement.dataset.theme = savedTheme;
+  }
+} catch (_error) {}
+</script>
 
 <link rel="stylesheet" href="/static/app.css">
 <script type="module" src="/static/app.js"></script>
@@ -163,6 +171,16 @@
           <span class="rail-key" aria-hidden="true">8</span>
         </a>
       </li>
+      <li>
+        <a class="rail-item" id="nav-scrims" href="#/scrims" data-view="scrims">
+          <svg class="rail-icon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="m3 3 10 10M13 3 3 13"/>
+            <path d="m2.2 2.2 2.3.5-1.8 1.8zM13.8 2.2l-.5 2.3-1.8-1.8zM2.2 13.8l.5-2.3 1.8 1.8zM13.8 13.8l-2.3-.5 1.8-1.8z"/>
+          </svg>
+          <span class="rail-label">Scrims</span>
+          <span class="rail-key" aria-hidden="true">9</span>
+        </a>
+      </li>
     </ul>
 
     <div class="rail-foot" id="rail-foot">
@@ -302,6 +320,18 @@
             <span class="field-label">Rounds per map</span>
             <input class="input num" id="run-repeat" type="number" min="1" max="500" step="1" value="1">
           </label>
+          <label class="field field-narrow" id="run-seed-policy-field">
+            <span class="field-label">Seed</span>
+            <select class="select" id="run-seed-policy" aria-describedby="run-seed-help">
+              <option value="random">Random</option>
+              <option value="fixed">Custom base</option>
+            </select>
+          </label>
+          <label class="field field-narrow field-seed" id="run-seed-field" hidden>
+            <span class="field-label">Base seed</span>
+            <input class="input num" id="run-seed" type="number" min="0" max="9223372036854775807"
+              step="1" value="1" aria-describedby="run-seed-help">
+          </label>
           <label class="toggle">
             <input type="checkbox" id="run-mirror" checked>
             <span class="toggle-track"><span class="toggle-thumb"></span></span>
@@ -314,6 +344,9 @@
           </label>
         </div>
 
+        <p class="field-hint" id="run-seed-help">Random picks a fresh seed for each map and round;
+          mirrored sides share it. Custom uses the base for round 1 and adds one each later round;
+          every map and mirrored side in a round shares it.</p>
         <p class="run-count" id="run-count"></p>
       </section>
 
@@ -360,7 +393,7 @@
           server — restart with <code>oarena serve -w N</code> to change them.</p>
       </section>
 
-      <p class="form-error" id="run-error" hidden></p>
+      <p class="form-error" id="run-error" role="alert" aria-live="polite" hidden></p>
     </div>
 
     <footer class="modal-foot">
@@ -378,9 +411,10 @@
     </header>
     <div class="modal-body">
       <dl class="shortcuts">
-        <dt><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><kbd>4</kbd><kbd>5</kbd><kbd>6</kbd><kbd>7</kbd><kbd>8</kbd></dt>
-        <dd>Ladder · Matrix · Games · Bots · Maps · Storage · FCode · Test runs</dd>
-        <dt><kbd>r</kbd></dt><dd>Open the Run dialog</dd>
+        <dt><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><kbd>4</kbd><kbd>5</kbd><kbd>6</kbd><kbd>7</kbd><kbd>8</kbd><kbd>9</kbd></dt>
+        <dd>Ladder · Matrix · Games · Bots · Maps · Storage · FCode · Test runs · Scrims</dd>
+        <dt><kbd>r</kbd></dt><dd>Toggle the Match Run dialog</dd>
+        <dt><kbd>r</kbd><kbd>Enter</kbd></dt><dd>Start the configured Match</dd>
         <dt><kbd>s</kbd></dt><dd>Stop the current run</dd>
         <dt><kbd>/</kbd></dt><dd>Focus the filter box</dd>
         <dt><kbd>l</kbd></dt><dd>Toggle the activity log</dd>

@@ -3,10 +3,31 @@
 const PROFILER_PREFIX = "[OARENA:ProfilerReport]";
 const LEGACY_PREFIX = "OARENA_TELEMETRY ";
 const TIME_FIELDS = ["total_us", "self_us", "max_total_us"];
+export const PROFILER_SPAN_MODES = Object.freeze(["avg", "total", "max"]);
 
 function finiteNumber(value) {
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 ? number : 0;
+}
+
+/** Inclusive/exclusive values used to sort and scale the profiler span bars. */
+export function profilerSpanMetric(span, mode = "avg") {
+  const selected = PROFILER_SPAN_MODES.includes(mode) ? mode : "avg";
+  const calls = Math.trunc(finiteNumber(span?.calls));
+  const total = finiteNumber(span?.total_us);
+  const self = finiteNumber(span?.self_us);
+
+  if (selected === "total") {
+    return { inclusive_us: total, exclusive_us: self };
+  }
+  if (selected === "max") {
+    // Reports contain the slowest inclusive call, but not its self time.
+    return { inclusive_us: finiteNumber(span?.max_total_us), exclusive_us: null };
+  }
+  return {
+    inclusive_us: calls ? total / calls : 0,
+    exclusive_us: calls ? self / calls : 0,
+  };
 }
 
 export function normaliseProfilerReport(payload, legacy = false) {

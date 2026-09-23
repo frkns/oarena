@@ -76,7 +76,9 @@ def test_square_shim_bridge_is_same_origin_and_validates_messages() -> None:
     assert 'message.type === "oarena:square:hello"' in source
     assert 'message.type === "oarena:square:theme"' in source
     assert 'message.type === "oarena:square:visibility"' in source
-    assert 'message.type !== "oarena:square:load"' in source
+    assert 'message.type === "oarena:square:load"' in source
+    assert 'message.type === "oarena:square:prepare"' in source
+    assert 'message.type === "oarena:square:cancel-prepare"' in source
     assert "message.replay instanceof ArrayBuffer" in source
     assert "sameOriginUrl(message.replayUrl)" in source
     assert 'cache: "force-cache"' in source
@@ -88,6 +90,8 @@ def test_square_shim_bridge_is_same_origin_and_validates_messages() -> None:
         "oarena:square:loading",
         "oarena:square:loaded",
         "oarena:square:error",
+        "oarena:square:prepared",
+        "oarena:square:prepare-error",
     ):
         assert status in source
 
@@ -97,15 +101,24 @@ def test_square_shim_fetches_replay_and_switches_metadata() -> None:
 
     assert "replayBytes(message, signal)" in source
     assert "metadataForGame(game)" in source
-    assert "await loadHandler({ requestId, replay, game, theme, key })" in source
+    assert "const loaded = await loadHandler({" in source
+    assert "metadata," in source
     assert "window.__OARENA_FCODE_METADATA__ = metadata" in source
     assert "new AbortController()" in source
     assert "bridgeState.loadController?.abort()" in source
     assert "signal," in source
     assert "bridgeState.applyChain.then(apply, apply)" in source
     assert 'error?.name !== "AbortError"' in source
-    assert "prepareHandler" not in source
-    assert "oarena:square:prepared" not in source
+    assert "async function runBridgePrepare(message, serial, signal)" in source
+    assert "bridgeState.prepareController?.abort()" in source
+    assert "const prepared = await prepareHandler({" in source
+    assert "const hasPrepared = bridgeState.hasPreparedHandler?.(key) === true" in source
+    assert "hasPrepared ? null : replayBytes(message, signal)" in source
+    assert "bridgeState.hasPreparedHandler?.(key) !== true" in source
+    assert "if (serial !== bridgeState.loadSerial || signal.aborted) return" in source
+    assert "function cancelBridgePrepare()" in source
+    assert "warmTimeSeries: message.warmTimeSeries === true" in source
+    assert 'postParent("oarena:square:prepared"' in source
 
 
 def test_square_viewer_extracts_profiler_records_from_bot_stdout() -> None:
